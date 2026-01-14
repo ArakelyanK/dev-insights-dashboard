@@ -10,6 +10,7 @@ export interface AnalysisRequest {
 export interface DeveloperMetrics {
   developer: string;
   developmentSpeedHours: number;
+  developmentCycles: number;
   totalReturnCount: number;
   codeReviewReturns: number;
   devTestingReturns: number;
@@ -22,9 +23,17 @@ export interface TesterMetrics {
   closedItemsCount: number;
   avgDevTestingSpeedHours: number;
   avgStgTestingSpeedHours: number;
+  devTestingCycles: number;
+  stgTestingCycles: number;
   devTestingIterations: number;
   stgTestingIterations: number;
   prCommentsCount: number;
+}
+
+export interface PRCommentAuthor {
+  author: string;
+  count: number;
+  isTester: boolean;
 }
 
 export interface ChartDataPoint {
@@ -33,9 +42,14 @@ export interface ChartDataPoint {
   category?: string;
 }
 
+export interface PRChartDataPoint extends ChartDataPoint {
+  isTester?: boolean;
+}
+
 export interface AnalysisResult {
   developerMetrics: DeveloperMetrics[];
   testerMetrics: TesterMetrics[];
+  prCommentAuthors: PRCommentAuthor[];
   summary: {
     totalWorkItems: number;
     totalRequirements: number;
@@ -52,7 +66,7 @@ export interface AnalysisResult {
     testingSpeed: ChartDataPoint[];
     returns: ChartDataPoint[];
     iterations: ChartDataPoint[];
-    prComments: ChartDataPoint[];
+    prComments: PRChartDataPoint[];
   };
 }
 
