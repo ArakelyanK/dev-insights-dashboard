@@ -352,19 +352,17 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
       }
       testerMetrics.get(devTestingTester)!.iterations++;
     } 
-    else if (devTestingStart && devTestingTester && 
-             (t.toState === STATES.APPROVED || t.toState === STATES.FIX_REQUIRED)) {
-      // Cycle ends - only count if we're coming from DEV_In Testing
-      if (t.fromState === STATES.DEV_IN_TESTING) {
-        const hours = (t.timestamp.getTime() - devTestingStart.getTime()) / (1000 * 60 * 60);
-        
-        if (!testerMetrics.has(devTestingTester)) {
-          testerMetrics.set(devTestingTester, { totalHours: 0, cycles: 0, iterations: 0 });
-        }
-        const data = testerMetrics.get(devTestingTester)!;
-        data.totalHours += hours;
-        data.cycles++;
+    // Close cycle on ANY transition OUT of DEV_In Testing
+    else if (devTestingStart && devTestingTester && t.fromState === STATES.DEV_IN_TESTING) {
+      const hours = (t.timestamp.getTime() - devTestingStart.getTime()) / (1000 * 60 * 60);
+      
+      if (!testerMetrics.has(devTestingTester)) {
+        testerMetrics.set(devTestingTester, { totalHours: 0, cycles: 0, iterations: 0 });
       }
+      const data = testerMetrics.get(devTestingTester)!;
+      data.totalHours += hours;
+      data.cycles++;
+      
       devTestingStart = null;
       devTestingTester = null;
     }
@@ -378,7 +376,7 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
  * 
  * Rules:
  * - Cycle starts on transition INTO STG_In Testing
- * - Cycle ends on transition to: Ready For Release OR Fix Required
+ * - Cycle ends on ANY transition OUT of STG_In Testing
  * - Attribute the entire cycle duration to the person who performed the transition INTO STG_In Testing
  * 
  * Returns: Map<tester, { totalHours, cycles, iterations }>
@@ -415,19 +413,17 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[]): Map<string,
       }
       testerMetrics.get(stgTestingTester)!.iterations++;
     } 
-    else if (stgTestingStart && stgTestingTester && 
-             (t.toState === STATES.READY_FOR_RELEASE || t.toState === STATES.FIX_REQUIRED)) {
-      // Cycle ends - only count if we're coming from STG_In Testing
-      if (t.fromState === STATES.STG_IN_TESTING) {
-        const hours = (t.timestamp.getTime() - stgTestingStart.getTime()) / (1000 * 60 * 60);
-        
-        if (!testerMetrics.has(stgTestingTester)) {
-          testerMetrics.set(stgTestingTester, { totalHours: 0, cycles: 0, iterations: 0 });
-        }
-        const data = testerMetrics.get(stgTestingTester)!;
-        data.totalHours += hours;
-        data.cycles++;
+    // Close cycle on ANY transition OUT of STG_In Testing
+    else if (stgTestingStart && stgTestingTester && t.fromState === STATES.STG_IN_TESTING) {
+      const hours = (t.timestamp.getTime() - stgTestingStart.getTime()) / (1000 * 60 * 60);
+      
+      if (!testerMetrics.has(stgTestingTester)) {
+        testerMetrics.set(stgTestingTester, { totalHours: 0, cycles: 0, iterations: 0 });
       }
+      const data = testerMetrics.get(stgTestingTester)!;
+      data.totalHours += hours;
+      data.cycles++;
+      
       stgTestingStart = null;
       stgTestingTester = null;
     }
