@@ -328,7 +328,20 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
   
   for (const t of transitions) {
     if (t.toState === STATES.DEV_IN_TESTING) {
-      // Start of a DEV testing cycle
+      // ROBUSTNESS FIX: If there's an open cycle, close it at the new transition's timestamp
+      // This handles cases where status transitions were skipped or data is messy
+      if (devTestingStart && devTestingTester) {
+        const hours = (t.timestamp.getTime() - devTestingStart.getTime()) / (1000 * 60 * 60);
+        
+        if (!testerMetrics.has(devTestingTester)) {
+          testerMetrics.set(devTestingTester, { totalHours: 0, cycles: 0, iterations: 0 });
+        }
+        const data = testerMetrics.get(devTestingTester)!;
+        data.totalHours += hours;
+        data.cycles++;
+      }
+      
+      // Start of a new DEV testing cycle
       devTestingStart = t.timestamp;
       // Attribute to the person who moved the item INTO DEV_In Testing
       devTestingTester = t.changedBy || t.assignedTo || 'Unknown';
@@ -378,7 +391,20 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[]): Map<string,
   
   for (const t of transitions) {
     if (t.toState === STATES.STG_IN_TESTING) {
-      // Start of a STG testing cycle
+      // ROBUSTNESS FIX: If there's an open cycle, close it at the new transition's timestamp
+      // This handles cases where status transitions were skipped or data is messy
+      if (stgTestingStart && stgTestingTester) {
+        const hours = (t.timestamp.getTime() - stgTestingStart.getTime()) / (1000 * 60 * 60);
+        
+        if (!testerMetrics.has(stgTestingTester)) {
+          testerMetrics.set(stgTestingTester, { totalHours: 0, cycles: 0, iterations: 0 });
+        }
+        const data = testerMetrics.get(stgTestingTester)!;
+        data.totalHours += hours;
+        data.cycles++;
+      }
+      
+      // Start of a new STG testing cycle
       stgTestingStart = t.timestamp;
       // Attribute to the person who moved the item INTO STG_In Testing
       stgTestingTester = t.changedBy || t.assignedTo || 'Unknown';
