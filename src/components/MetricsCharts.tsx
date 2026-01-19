@@ -40,10 +40,10 @@ export function MetricsCharts({ chartData }: MetricsChartsProps) {
 
   return (
     <div className="grid gap-6 md:grid-cols-2 animate-fade-in">
-      {/* Development Speed Chart */}
+      {/* Development Time Chart */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Development Speed (Avg Hours)</CardTitle>
+          <CardTitle className="text-lg">Avg Dev Time (Active) - Hours</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="h-[300px]">
@@ -72,10 +72,10 @@ export function MetricsCharts({ chartData }: MetricsChartsProps) {
         </CardContent>
       </Card>
 
-      {/* Testing Speed Chart */}
+      {/* Testing Time Chart */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Testing Speed by Environment (Avg Hours)</CardTitle>
+          <CardTitle className="text-lg">Avg Test Time by Environment - Hours</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="h-[300px]">

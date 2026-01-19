@@ -54,9 +54,9 @@ export function AnalysisResults({ result, onBack }: AnalysisResultsProps) {
           icon={FileCode2}
         />
         <MetricCard
-          title="Avg Development Speed"
-          value={formatDuration(summary.avgDevelopmentSpeedHours)}
-          subtitle="Active → Code Review"
+          title="Avg Dev Time (Active)"
+          value={formatDuration(summary.avgDevTimeHours)}
+          subtitle="Active state per task"
           icon={Clock}
         />
         <MetricCard
@@ -74,18 +74,18 @@ export function AnalysisResults({ result, onBack }: AnalysisResultsProps) {
         />
       </div>
 
-      {/* Testing Speed Summary */}
+      {/* Testing Time Summary */}
       <div className="grid gap-4 md:grid-cols-2">
         <MetricCard
-          title="Avg DEV Testing Speed"
-          value={formatDuration(summary.avgDevTestingSpeedHours)}
-          subtitle="DEV_In Testing → Approved"
+          title="Avg DEV Test Time"
+          value={formatDuration(summary.avgDevTestTimeHours)}
+          subtitle="DEV_In Testing per task"
           icon={TestTube2}
         />
         <MetricCard
-          title="Avg STG Testing Speed"
-          value={formatDuration(summary.avgStgTestingSpeedHours)}
-          subtitle="STG_In Testing → Ready For Release"
+          title="Avg STG Test Time"
+          value={formatDuration(summary.avgStgTestTimeHours)}
+          subtitle="STG_In Testing per task"
           icon={TestTube2}
         />
       </div>

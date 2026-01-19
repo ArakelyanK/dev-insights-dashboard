@@ -9,25 +9,36 @@ export interface AnalysisRequest {
 
 export interface DeveloperMetrics {
   developer: string;
-  developmentSpeedHours: number;
+  avgDevTimeHours: number; // Renamed from developmentSpeedHours
   developmentCycles: number;
   totalReturnCount: number;
   codeReviewReturns: number;
   devTestingReturns: number;
   stgTestingReturns: number;
   itemsCompleted: number;
+  // New per-task averages
+  avgTotalReturnsPerTask: number;
+  avgCodeReviewReturnsPerTask: number;
+  avgDevTestingReturnsPerTask: number;
+  avgStgTestingReturnsPerTask: number;
 }
 
 export interface TesterMetrics {
   tester: string;
   closedItemsCount: number;
-  avgDevTestingSpeedHours: number;
-  avgStgTestingSpeedHours: number;
+  avgDevTestTimeHours: number; // Renamed from avgDevTestingSpeedHours
+  avgStgTestTimeHours: number; // Renamed from avgStgTestingSpeedHours
   devTestingCycles: number;
   stgTestingCycles: number;
   devTestingIterations: number;
   stgTestingIterations: number;
   prCommentsCount: number;
+  // New per-task averages
+  avgDevIterationsPerTask: number;
+  avgStgIterationsPerTask: number;
+  avgPrCommentsPerPr: number;
+  tasksWorkedOn: number;
+  prsReviewed: number;
 }
 
 export interface PRCommentAuthor {
@@ -55,9 +66,9 @@ export interface AnalysisResult {
     totalRequirements: number;
     totalBugs: number;
     totalTasks: number;
-    avgDevelopmentSpeedHours: number;
-    avgDevTestingSpeedHours: number;
-    avgStgTestingSpeedHours: number;
+    avgDevTimeHours: number; // Renamed
+    avgDevTestTimeHours: number; // Renamed
+    avgStgTestTimeHours: number; // Renamed
     totalReturns: number;
     totalPrComments: number;
   };
@@ -110,6 +121,7 @@ export const STATES = {
   DEV_IN_TESTING: 'DEV_In Testing',
   STG_IN_TESTING: 'STG_In Testing',
   DEV_ACCEPTANCE_TESTING: 'DEV_Acceptance Testing',
+  STG_ACCEPTANCE_TESTING: 'STG_Acceptance Testing',
   APPROVED: 'Approved',
   READY_FOR_RELEASE: 'Ready For Release',
   RELEASED: 'Released',
