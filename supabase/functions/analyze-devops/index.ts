@@ -1,5 +1,8 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
+// DEBUG FLAG - Set to true to enable detailed metric logging
+const DEBUG = true;
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -18,6 +21,13 @@ const STATES = {
   READY_FOR_RELEASE: 'Ready For Release',
   RELEASED: 'Released',
 } as const;
+
+// Debug logging helpers
+function debugLog(category: string, data: Record<string, unknown>) {
+  if (DEBUG) {
+    console.log(`[${category}]`, JSON.stringify(data, null, 2));
+  }
+}
 
 interface WorkItemRevision {
   id: number;
@@ -205,17 +215,21 @@ function extractTransitions(revisions: WorkItemRevision[], workItemId: number): 
  * - Final average = totalActiveTime / numberOfTasks (NOT divided by cycles)
  * - Attribute each cycle to the developer assigned at the moment the cycle ENDS
  * 
- * Returns: { totalHours, cycles, developerCycles: Map<developer, { totalHours, cycles }> }
+ * Returns: { totalHours, cycles, developerCycles: Map<developer, { totalHours, cycles }>, debugPeriods: array }
  */
-function calculateDevelopmentTime(transitions: TransitionEvent[]): {
+function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: number): {
   totalHours: number;
   cycles: number;
   developerCycles: Map<string, { totalHours: number; cycles: number }>;
+  debugPeriods: Array<{ start: string; end: string; durationHours: number; developer: string }>;
+  stoppedAtAcceptance: boolean;
 } {
   const developerCycles = new Map<string, { totalHours: number; cycles: number }>();
+  const debugPeriods: Array<{ start: string; end: string; durationHours: number; developer: string }> = [];
   let totalHours = 0;
   let cycles = 0;
   let activeStartTimestamp: Date | null = null;
+  let stoppedAtAcceptance = false;
 
   for (const t of transitions) {
     // Transition INTO Active starts a new development cycle
@@ -236,6 +250,14 @@ function calculateDevelopmentTime(transitions: TransitionEvent[]): {
       const devData = developerCycles.get(developer)!;
       devData.totalHours += hours;
       devData.cycles++;
+
+      // Debug: record period
+      debugPeriods.push({
+        start: activeStartTimestamp.toISOString(),
+        end: t.timestamp.toISOString(),
+        durationHours: Math.round(hours * 100) / 100,
+        developer,
+      });
 
       activeStartTimestamp = null;
     }
@@ -258,14 +280,23 @@ function calculateDevelopmentTime(transitions: TransitionEvent[]): {
         devData.totalHours += hours;
         devData.cycles++;
 
+        // Debug: record period
+        debugPeriods.push({
+          start: activeStartTimestamp.toISOString(),
+          end: t.timestamp.toISOString(),
+          durationHours: Math.round(hours * 100) / 100,
+          developer,
+        });
+
         activeStartTimestamp = null;
       }
       // Stop processing - development phase ends at first DEV_Acceptance Testing
+      stoppedAtAcceptance = true;
       break;
     }
   }
 
-  return { totalHours, cycles, developerCycles };
+  return { totalHours, cycles, developerCycles, debugPeriods, stoppedAtAcceptance };
 }
 
 /**
@@ -275,16 +306,18 @@ function calculateDevelopmentTime(transitions: TransitionEvent[]): {
  * - Attribute returns based on the last known developer
  * - Track separate counts for Code Review, DEV Testing, and STG Testing returns
  */
-function countReturns(transitions: TransitionEvent[]): {
+function countReturns(transitions: TransitionEvent[], workItemId: number): {
   codeReviewReturns: number;
   devTestingReturns: number;
   stgTestingReturns: number;
   returnsByDeveloper: Map<string, { codeReview: number; devTesting: number; stgTesting: number }>;
+  debugReturns: Array<{ fromState: string; toState: string; developer: string; type: string }>;
 } {
   let codeReviewReturns = 0;
   let devTestingReturns = 0;
   let stgTestingReturns = 0;
   const returnsByDeveloper = new Map<string, { codeReview: number; devTesting: number; stgTesting: number }>();
+  const debugReturns: Array<{ fromState: string; toState: string; developer: string; type: string }> = [];
 
   // Track the last known developer (from development cycle completions)
   let lastKnownDeveloper: string | null = null;
@@ -303,21 +336,33 @@ function countReturns(transitions: TransitionEvent[]): {
         returnsByDeveloper.set(developer, { codeReview: 0, devTesting: 0, stgTesting: 0 });
       }
       const devReturns = returnsByDeveloper.get(developer)!;
+      let returnType = 'unknown';
 
       if (t.fromState === STATES.CODE_REVIEW) {
         codeReviewReturns++;
         devReturns.codeReview++;
+        returnType = 'Code Review';
       } else if (t.fromState === STATES.DEV_IN_TESTING) {
         devTestingReturns++;
         devReturns.devTesting++;
+        returnType = 'DEV Testing';
       } else if (t.fromState === STATES.STG_IN_TESTING) {
         stgTestingReturns++;
         devReturns.stgTesting++;
+        returnType = 'STG Testing';
       }
+
+      // Debug: record return
+      debugReturns.push({
+        fromState: t.fromState,
+        toState: t.toState,
+        developer,
+        type: returnType,
+      });
     }
   }
 
-  return { codeReviewReturns, devTestingReturns, stgTestingReturns, returnsByDeveloper };
+  return { codeReviewReturns, devTestingReturns, stgTestingReturns, returnsByDeveloper, debugReturns };
 }
 
 /**
@@ -336,8 +381,14 @@ function countReturns(transitions: TransitionEvent[]): {
  * 
  * Returns: Map<tester, { totalHours, cycles, iterations }>
  */
-function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string, { totalHours: number; cycles: number; iterations: number }> {
+function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
+  metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
+  debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }>;
+  debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }>;
+} {
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
+  const debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }> = [];
+  const debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }> = [];
   
   let devTestingStart: Date | null = null;
   let devTestingTester: string | null = null;
@@ -356,6 +407,14 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
         const data = testerMetrics.get(devTestingTester)!;
         data.totalHours += hours;
         data.cycles++;
+
+        // Debug: record cycle (closed due to new cycle starting)
+        debugCycles.push({
+          tester: devTestingTester,
+          start: devTestingStart.toISOString(),
+          end: t.timestamp.toISOString(),
+          durationHours: Math.round(hours * 100) / 100,
+        });
       }
       
       // Start of a new DEV testing cycle
@@ -375,9 +434,23 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
       const isFromAcceptance = t.fromState === STATES.DEV_ACCEPTANCE_TESTING;
       const isSameTester = currentTester === lastDevTestingTester;
       
+      let iterationCounted = false;
+      let reason = '';
       if (!isFromAcceptance || !isSameTester) {
         testerMetrics.get(devTestingTester)!.iterations++;
+        iterationCounted = true;
+        reason = isFromAcceptance ? 'Different tester from acceptance' : 'Not from acceptance state';
+      } else {
+        reason = 'Same tester returning from acceptance - not counted';
       }
+
+      // Debug: record iteration decision
+      debugIterations.push({
+        tester: currentTester,
+        fromState: t.fromState,
+        counted: iterationCounted,
+        reason,
+      });
       
       lastDevTestingTester = currentTester;
       lastExitWasAcceptance = false;
@@ -394,6 +467,14 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
         const data = testerMetrics.get(devTestingTester)!;
         data.totalHours += hours;
         data.cycles++;
+
+        // Debug: record cycle
+        debugCycles.push({
+          tester: devTestingTester,
+          start: devTestingStart.toISOString(),
+          end: t.timestamp.toISOString(),
+          durationHours: Math.round(hours * 100) / 100,
+        });
       }
       
       devTestingStart = null;
@@ -406,7 +487,7 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
     }
   }
   
-  return testerMetrics;
+  return { metrics: testerMetrics, debugCycles, debugIterations };
 }
 
 /**
@@ -425,8 +506,14 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[]): Map<string,
  * 
  * Returns: Map<tester, { totalHours, cycles, iterations }>
  */
-function calculateStgTestingMetrics(transitions: TransitionEvent[]): Map<string, { totalHours: number; cycles: number; iterations: number }> {
+function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
+  metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
+  debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }>;
+  debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }>;
+} {
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
+  const debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }> = [];
+  const debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }> = [];
   
   let stgTestingStart: Date | null = null;
   let stgTestingTester: string | null = null;
@@ -445,6 +532,14 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[]): Map<string,
         const data = testerMetrics.get(stgTestingTester)!;
         data.totalHours += hours;
         data.cycles++;
+
+        // Debug: record cycle (closed due to new cycle starting)
+        debugCycles.push({
+          tester: stgTestingTester,
+          start: stgTestingStart.toISOString(),
+          end: t.timestamp.toISOString(),
+          durationHours: Math.round(hours * 100) / 100,
+        });
       }
       
       // Start of a new STG testing cycle
@@ -464,9 +559,23 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[]): Map<string,
       const isFromAcceptance = t.fromState === STATES.STG_ACCEPTANCE_TESTING;
       const isSameTester = currentTester === lastStgTestingTester;
       
+      let iterationCounted = false;
+      let reason = '';
       if (!isFromAcceptance || !isSameTester) {
         testerMetrics.get(stgTestingTester)!.iterations++;
+        iterationCounted = true;
+        reason = isFromAcceptance ? 'Different tester from acceptance' : 'Not from acceptance state';
+      } else {
+        reason = 'Same tester returning from acceptance - not counted';
       }
+
+      // Debug: record iteration decision
+      debugIterations.push({
+        tester: currentTester,
+        fromState: t.fromState,
+        counted: iterationCounted,
+        reason,
+      });
       
       lastStgTestingTester = currentTester;
       lastExitWasAcceptance = false;
@@ -483,6 +592,14 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[]): Map<string,
         const data = testerMetrics.get(stgTestingTester)!;
         data.totalHours += hours;
         data.cycles++;
+
+        // Debug: record cycle
+        debugCycles.push({
+          tester: stgTestingTester,
+          start: stgTestingStart.toISOString(),
+          end: t.timestamp.toISOString(),
+          durationHours: Math.round(hours * 100) / 100,
+        });
       }
       
       stgTestingStart = null;
@@ -495,7 +612,7 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[]): Map<string,
     }
   }
   
-  return testerMetrics;
+  return { metrics: testerMetrics, debugCycles, debugIterations };
 }
 
 /**
@@ -507,12 +624,17 @@ async function getPRComments(
   project: string,
   workItem: WorkItem,
   pat: string
-): Promise<{ commentsByAuthor: Map<string, number>; prCount: number }> {
+): Promise<{ 
+  commentsByAuthor: Map<string, number>; 
+  prCount: number;
+  debugComments: Array<{ author: string; isTopLevel: boolean; counted: boolean; reason: string }>;
+}> {
   const commentsByAuthor = new Map<string, number>();
+  const debugComments: Array<{ author: string; isTopLevel: boolean; counted: boolean; reason: string }> = [];
   let prCount = 0;
   
   if (!workItem.relations) {
-    return { commentsByAuthor, prCount };
+    return { commentsByAuthor, prCount, debugComments };
   }
   
   // Find ArtifactLink relations that are Pull Requests
@@ -539,14 +661,24 @@ async function getPRComments(
         // Only count the FIRST comment in each thread (not replies)
         // Replies have parentCommentId set
         for (const comment of thread.comments || []) {
+          const author = comment.author?.displayName || 'Unknown';
+          const isTopLevel = !comment.parentCommentId;
+          const isSystem = comment.commentType === 'system';
+
           // Skip replies (comments with parentCommentId)
-          if (comment.parentCommentId) continue;
+          if (!isTopLevel) {
+            debugComments.push({ author, isTopLevel: false, counted: false, reason: 'Reply (has parentCommentId)' });
+            continue;
+          }
           
           // Skip system comments
-          if (comment.commentType === 'system') continue;
+          if (isSystem) {
+            debugComments.push({ author, isTopLevel: true, counted: false, reason: 'System comment' });
+            continue;
+          }
           
-          const author = comment.author?.displayName || 'Unknown';
           commentsByAuthor.set(author, (commentsByAuthor.get(author) || 0) + 1);
+          debugComments.push({ author, isTopLevel: true, counted: true, reason: 'Valid top-level comment' });
         }
       }
     } catch {
@@ -555,7 +687,7 @@ async function getPRComments(
     }
   }
   
-  return { commentsByAuthor, prCount };
+  return { commentsByAuthor, prCount, debugComments };
 }
 
 serve(async (req) => {
@@ -661,6 +793,23 @@ serve(async (req) => {
     for (const workItem of metricsItems) {
       const revisions = await getWorkItemRevisions(organization, project, workItem.id, pat);
       const transitions = extractTransitions(revisions, workItem.id);
+      const workItemType = workItem.fields['System.WorkItemType'] as string;
+      const finalState = workItem.fields['System.State'] as string;
+      
+      // DEBUG: Log work item basic info and transitions
+      debugLog('WORK_ITEM', {
+        workItemId: workItem.id,
+        type: workItemType,
+        finalState,
+        transitionsCount: transitions.length,
+        transitions: transitions.map(t => ({
+          from: t.fromState,
+          to: t.toState,
+          timestamp: t.timestamp.toISOString(),
+          changedBy: t.changedBy,
+          assignedTo: t.assignedTo,
+        })),
+      });
       
       // Collect testers from TestedBy fields for PR comment filtering only
       const tester1 = getDisplayName(workItem.fields['Custom.TestedBy1']);
@@ -669,8 +818,21 @@ serve(async (req) => {
       if (tester2) allTesters.add(tester2);
       
       // Calculate development time with developer attribution at cycle end
-      const devTimeResult = calculateDevelopmentTime(transitions);
+      const devTimeResult = calculateDevelopmentTime(transitions, workItem.id);
       globalDevTotalHours += devTimeResult.totalHours;
+
+      // DEBUG: Log development time metrics
+      debugLog('DEV_METRIC', {
+        workItemId: workItem.id,
+        activePeriods: devTimeResult.debugPeriods,
+        totalActiveHours: Math.round(devTimeResult.totalHours * 100) / 100,
+        cycles: devTimeResult.cycles,
+        stoppedAtAcceptance: devTimeResult.stoppedAtAcceptance,
+        participatesInDevAvg: devTimeResult.totalHours > 0,
+        reason: devTimeResult.totalHours > 0 
+          ? `Has ${devTimeResult.cycles} development cycle(s)` 
+          : 'No completed Active periods found',
+      });
 
       // Update developer metrics from development cycles
       for (const [developer, data] of devTimeResult.developerCycles) {
@@ -692,7 +854,21 @@ serve(async (req) => {
       }
       
       // Count returns with developer attribution
-      const returns = countReturns(transitions);
+      const returns = countReturns(transitions, workItem.id);
+
+      // DEBUG: Log returns
+      if (returns.debugReturns.length > 0) {
+        debugLog('RETURNS', {
+          workItemId: workItem.id,
+          returns: returns.debugReturns,
+          totals: {
+            codeReview: returns.codeReviewReturns,
+            devTesting: returns.devTestingReturns,
+            stgTesting: returns.stgTestingReturns,
+          },
+        });
+      }
+
       for (const [developer, returnData] of returns.returnsByDeveloper) {
         if (!developerData.has(developer)) {
           developerData.set(developer, {
@@ -728,8 +904,22 @@ serve(async (req) => {
       }
       
       // Calculate DEV testing metrics
-      const devTestingMetrics = calculateDevTestingMetrics(transitions);
-      for (const [tester, data] of devTestingMetrics) {
+      const devTestingResult = calculateDevTestingMetrics(transitions, workItem.id);
+
+      // DEBUG: Log DEV testing metrics
+      if (devTestingResult.debugCycles.length > 0 || devTestingResult.debugIterations.length > 0) {
+        debugLog('TEST_METRIC', {
+          workItemId: workItem.id,
+          environment: 'DEV',
+          cycles: devTestingResult.debugCycles,
+          iterationDecisions: devTestingResult.debugIterations,
+          totalTestingHours: Math.round(
+            Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
+          ) / 100,
+        });
+      }
+
+      for (const [tester, data] of devTestingResult.metrics) {
         if (!testerData.has(tester)) {
           testerData.set(tester, {
             closedItems: new Set(),
@@ -757,8 +947,22 @@ serve(async (req) => {
       }
 
       // Calculate STG testing metrics
-      const stgTestingMetrics = calculateStgTestingMetrics(transitions);
-      for (const [tester, data] of stgTestingMetrics) {
+      const stgTestingResult = calculateStgTestingMetrics(transitions, workItem.id);
+
+      // DEBUG: Log STG testing metrics
+      if (stgTestingResult.debugCycles.length > 0 || stgTestingResult.debugIterations.length > 0) {
+        debugLog('TEST_METRIC', {
+          workItemId: workItem.id,
+          environment: 'STG',
+          cycles: stgTestingResult.debugCycles,
+          iterationDecisions: stgTestingResult.debugIterations,
+          totalTestingHours: Math.round(
+            Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
+          ) / 100,
+        });
+      }
+
+      for (const [tester, data] of stgTestingResult.metrics) {
         if (!testerData.has(tester)) {
           testerData.set(tester, {
             closedItems: new Set(),
@@ -784,11 +988,50 @@ serve(async (req) => {
           testData.closedItems.add(workItem.id);
         }
       }
+
+      // DEBUG: Log work item summary
+      debugLog('SUMMARY', {
+        workItemId: workItem.id,
+        type: workItemType,
+        finalState,
+        devTimeHours: Math.round(devTimeResult.totalHours * 100) / 100,
+        devTestingHours: Math.round(
+          Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
+        ) / 100,
+        stgTestingHours: Math.round(
+          Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
+        ) / 100,
+        totalReturns: returns.codeReviewReturns + returns.devTestingReturns + returns.stgTestingReturns,
+        devIterations: Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.iterations, 0),
+        stgIterations: Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.iterations, 0),
+      });
     }
 
     // Process all items (including Tasks) for PR comments - strictly by author
     for (const workItem of prItems) {
-      const { commentsByAuthor, prCount } = await getPRComments(organization, project, workItem, pat);
+      const { commentsByAuthor, prCount, debugComments } = await getPRComments(organization, project, workItem, pat);
+      
+      // DEBUG: Log PR comments
+      if (debugComments.length > 0) {
+        const commentSummary: Record<string, { counted: number; notCounted: number }> = {};
+        for (const c of debugComments) {
+          if (!commentSummary[c.author]) {
+            commentSummary[c.author] = { counted: 0, notCounted: 0 };
+          }
+          if (c.counted) {
+            commentSummary[c.author].counted++;
+          } else {
+            commentSummary[c.author].notCounted++;
+          }
+        }
+        
+        debugLog('PR', {
+          workItemId: workItem.id,
+          prCount,
+          commentDetails: debugComments,
+          summary: commentSummary,
+        });
+      }
       
       for (const [author, count] of commentsByAuthor) {
         allPrComments.set(author, (allPrComments.get(author) || 0) + count);
@@ -800,6 +1043,17 @@ serve(async (req) => {
         }
       }
     }
+
+    // DEBUG: Log final averaging info
+    debugLog('AVERAGING', {
+      numTasksForAverage: numTasks,
+      globalDevTotalHours: Math.round(globalDevTotalHours * 100) / 100,
+      globalDevTestingTotalHours: Math.round(globalDevTestingTotalHours * 100) / 100,
+      globalStgTestingTotalHours: Math.round(globalStgTestingTotalHours * 100) / 100,
+      avgDevTimeHours: numTasks > 0 ? Math.round((globalDevTotalHours / numTasks) * 100) / 100 : 0,
+      avgDevTestTimeHours: numTasks > 0 ? Math.round((globalDevTestingTotalHours / numTasks) * 100) / 100 : 0,
+      avgStgTestTimeHours: numTasks > 0 ? Math.round((globalStgTestingTotalHours / numTasks) * 100) / 100 : 0,
+    });
 
     // Build developer metrics array with per-task averages
     const developerMetrics: DeveloperMetrics[] = Array.from(developerData.entries())
