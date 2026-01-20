@@ -1,8 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
-// DEBUG FLAG - Set to true to enable detailed metric logging
-const DEBUG = true;
-
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -22,11 +19,78 @@ const STATES = {
   RELEASED: 'Released',
 } as const;
 
-// Debug logging helpers
-function debugLog(category: string, data: Record<string, unknown>) {
-  if (DEBUG) {
-    console.log(`[${category}]`, JSON.stringify(data, null, 2));
-  }
+// Structured debug log for a single work item - grouped by workItemId
+interface WorkItemDebugLog {
+  workItemId: number;
+  type: string;
+  finalState: string;
+  transitions: Array<{
+    fromState: string;
+    toState: string;
+    changedDate: string;
+    assignedTo: string | null;
+    changedBy: string | null;
+  }>;
+  development: {
+    activePeriods: Array<{
+      start: string;
+      end: string;
+      hoursAdded: number;
+      closeReason: string;
+      developer: string;
+    }>;
+    totalActiveHours: number;
+    participatesInDevAvg: boolean;
+    reason: string;
+  };
+  devTesting: {
+    cycles: Array<{
+      tester: string;
+      start: string;
+      end: string;
+      endReason: string;
+      hoursAdded: number;
+    }>;
+    iterations: Array<{
+      tester: string;
+      fromState: string;
+      counted: boolean;
+      reason: string;
+    }>;
+    totalTestingHours: number;
+  };
+  stgTesting: {
+    cycles: Array<{
+      tester: string;
+      start: string;
+      end: string;
+      endReason: string;
+      hoursAdded: number;
+    }>;
+    iterations: Array<{
+      tester: string;
+      fromState: string;
+      counted: boolean;
+      reason: string;
+    }>;
+    totalTestingHours: number;
+  };
+  returns: Array<{
+    fromState: string;
+    toState: string;
+    developer: string;
+    type: string;
+  }>;
+  prComments: Array<{
+    prId: string;
+    author: string;
+    counted: boolean;
+    reason: string;
+  }>;
+}
+
+function emitWorkItemDebugLog(log: WorkItemDebugLog) {
+  console.log('[WORK_ITEM_DEBUG]', JSON.stringify(log, null, 2));
 }
 
 interface WorkItemRevision {
@@ -221,11 +285,11 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
   totalHours: number;
   cycles: number;
   developerCycles: Map<string, { totalHours: number; cycles: number }>;
-  debugPeriods: Array<{ start: string; end: string; durationHours: number; developer: string }>;
+  debugPeriods: Array<{ start: string; end: string; hoursAdded: number; closeReason: string; developer: string }>;
   stoppedAtAcceptance: boolean;
 } {
   const developerCycles = new Map<string, { totalHours: number; cycles: number }>();
-  const debugPeriods: Array<{ start: string; end: string; durationHours: number; developer: string }> = [];
+  const debugPeriods: Array<{ start: string; end: string; hoursAdded: number; closeReason: string; developer: string }> = [];
   let totalHours = 0;
   let cycles = 0;
   let activeStartTimestamp: Date | null = null;
@@ -251,11 +315,12 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
       devData.totalHours += hours;
       devData.cycles++;
 
-      // Debug: record period
+      // Debug: record period with close reason
       debugPeriods.push({
         start: activeStartTimestamp.toISOString(),
         end: t.timestamp.toISOString(),
-        durationHours: Math.round(hours * 100) / 100,
+        hoursAdded: Math.round(hours * 100) / 100,
+        closeReason: 'Transition to Code Review',
         developer,
       });
 
@@ -280,11 +345,12 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
         devData.totalHours += hours;
         devData.cycles++;
 
-        // Debug: record period
+        // Debug: record period with close reason
         debugPeriods.push({
           start: activeStartTimestamp.toISOString(),
           end: t.timestamp.toISOString(),
-          durationHours: Math.round(hours * 100) / 100,
+          hoursAdded: Math.round(hours * 100) / 100,
+          closeReason: 'Transition to DEV_Acceptance Testing (Code Review skipped)',
           developer,
         });
 
@@ -383,11 +449,11 @@ function countReturns(transitions: TransitionEvent[], workItemId: number): {
  */
 function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
   metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
-  debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }>;
+  debugCycles: Array<{ tester: string; start: string; end: string; endReason: string; hoursAdded: number }>;
   debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }>;
 } {
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
-  const debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }> = [];
+  const debugCycles: Array<{ tester: string; start: string; end: string; endReason: string; hoursAdded: number }> = [];
   const debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }> = [];
   
   let devTestingStart: Date | null = null;
@@ -413,7 +479,8 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
           tester: devTestingTester,
           start: devTestingStart.toISOString(),
           end: t.timestamp.toISOString(),
-          durationHours: Math.round(hours * 100) / 100,
+          endReason: 'New testing cycle started (previous cycle auto-closed)',
+          hoursAdded: Math.round(hours * 100) / 100,
         });
       }
       
@@ -468,12 +535,13 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
         data.totalHours += hours;
         data.cycles++;
 
-        // Debug: record cycle
+        // Debug: record cycle with end reason
         debugCycles.push({
           tester: devTestingTester,
           start: devTestingStart.toISOString(),
           end: t.timestamp.toISOString(),
-          durationHours: Math.round(hours * 100) / 100,
+          endReason: `Transition to ${t.toState}`,
+          hoursAdded: Math.round(hours * 100) / 100,
         });
       }
       
@@ -508,11 +576,11 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
  */
 function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
   metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
-  debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }>;
+  debugCycles: Array<{ tester: string; start: string; end: string; endReason: string; hoursAdded: number }>;
   debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }>;
 } {
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
-  const debugCycles: Array<{ tester: string; start: string; end: string; durationHours: number }> = [];
+  const debugCycles: Array<{ tester: string; start: string; end: string; endReason: string; hoursAdded: number }> = [];
   const debugIterations: Array<{ tester: string; fromState: string; counted: boolean; reason: string }> = [];
   
   let stgTestingStart: Date | null = null;
@@ -538,7 +606,8 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
           tester: stgTestingTester,
           start: stgTestingStart.toISOString(),
           end: t.timestamp.toISOString(),
-          durationHours: Math.round(hours * 100) / 100,
+          endReason: 'New testing cycle started (previous cycle auto-closed)',
+          hoursAdded: Math.round(hours * 100) / 100,
         });
       }
       
@@ -593,12 +662,13 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
         data.totalHours += hours;
         data.cycles++;
 
-        // Debug: record cycle
+        // Debug: record cycle with end reason
         debugCycles.push({
           tester: stgTestingTester,
           start: stgTestingStart.toISOString(),
           end: t.timestamp.toISOString(),
-          durationHours: Math.round(hours * 100) / 100,
+          endReason: `Transition to ${t.toState}`,
+          hoursAdded: Math.round(hours * 100) / 100,
         });
       }
       
@@ -627,10 +697,10 @@ async function getPRComments(
 ): Promise<{ 
   commentsByAuthor: Map<string, number>; 
   prCount: number;
-  debugComments: Array<{ author: string; isTopLevel: boolean; counted: boolean; reason: string }>;
+  debugComments: Array<{ prId: string; author: string; counted: boolean; reason: string }>;
 }> {
   const commentsByAuthor = new Map<string, number>();
-  const debugComments: Array<{ author: string; isTopLevel: boolean; counted: boolean; reason: string }> = [];
+  const debugComments: Array<{ prId: string; author: string; counted: boolean; reason: string }> = [];
   let prCount = 0;
   
   if (!workItem.relations) {
@@ -667,18 +737,18 @@ async function getPRComments(
 
           // Skip replies (comments with parentCommentId)
           if (!isTopLevel) {
-            debugComments.push({ author, isTopLevel: false, counted: false, reason: 'Reply (has parentCommentId)' });
+            debugComments.push({ prId, author, counted: false, reason: 'Reply (has parentCommentId)' });
             continue;
           }
           
           // Skip system comments
           if (isSystem) {
-            debugComments.push({ author, isTopLevel: true, counted: false, reason: 'System comment' });
+            debugComments.push({ prId, author, counted: false, reason: 'System comment' });
             continue;
           }
           
           commentsByAuthor.set(author, (commentsByAuthor.get(author) || 0) + 1);
-          debugComments.push({ author, isTopLevel: true, counted: true, reason: 'Valid top-level comment' });
+          debugComments.push({ prId, author, counted: true, reason: 'Valid top-level comment' });
         }
       }
     } catch {
@@ -789,27 +859,15 @@ serve(async (req) => {
     let globalStgTestingTotalHours = 0;
     const numTasks = metricsItems.length;
 
+    // Store PR debug logs by workItemId for later merging
+    const prDebugByWorkItem: Map<number, Array<{ prId: string; author: string; counted: boolean; reason: string }>> = new Map();
+
     // Process Requirements and Bugs for metrics
     for (const workItem of metricsItems) {
       const revisions = await getWorkItemRevisions(organization, project, workItem.id, pat);
       const transitions = extractTransitions(revisions, workItem.id);
       const workItemType = workItem.fields['System.WorkItemType'] as string;
       const finalState = workItem.fields['System.State'] as string;
-      
-      // DEBUG: Log work item basic info and transitions
-      debugLog('WORK_ITEM', {
-        workItemId: workItem.id,
-        type: workItemType,
-        finalState,
-        transitionsCount: transitions.length,
-        transitions: transitions.map(t => ({
-          from: t.fromState,
-          to: t.toState,
-          timestamp: t.timestamp.toISOString(),
-          changedBy: t.changedBy,
-          assignedTo: t.assignedTo,
-        })),
-      });
       
       // Collect testers from TestedBy fields for PR comment filtering only
       const tester1 = getDisplayName(workItem.fields['Custom.TestedBy1']);
@@ -820,19 +878,6 @@ serve(async (req) => {
       // Calculate development time with developer attribution at cycle end
       const devTimeResult = calculateDevelopmentTime(transitions, workItem.id);
       globalDevTotalHours += devTimeResult.totalHours;
-
-      // DEBUG: Log development time metrics
-      debugLog('DEV_METRIC', {
-        workItemId: workItem.id,
-        activePeriods: devTimeResult.debugPeriods,
-        totalActiveHours: Math.round(devTimeResult.totalHours * 100) / 100,
-        cycles: devTimeResult.cycles,
-        stoppedAtAcceptance: devTimeResult.stoppedAtAcceptance,
-        participatesInDevAvg: devTimeResult.totalHours > 0,
-        reason: devTimeResult.totalHours > 0 
-          ? `Has ${devTimeResult.cycles} development cycle(s)` 
-          : 'No completed Active periods found',
-      });
 
       // Update developer metrics from development cycles
       for (const [developer, data] of devTimeResult.developerCycles) {
@@ -855,19 +900,6 @@ serve(async (req) => {
       
       // Count returns with developer attribution
       const returns = countReturns(transitions, workItem.id);
-
-      // DEBUG: Log returns
-      if (returns.debugReturns.length > 0) {
-        debugLog('RETURNS', {
-          workItemId: workItem.id,
-          returns: returns.debugReturns,
-          totals: {
-            codeReview: returns.codeReviewReturns,
-            devTesting: returns.devTestingReturns,
-            stgTesting: returns.stgTestingReturns,
-          },
-        });
-      }
 
       for (const [developer, returnData] of returns.returnsByDeveloper) {
         if (!developerData.has(developer)) {
@@ -906,19 +938,6 @@ serve(async (req) => {
       // Calculate DEV testing metrics
       const devTestingResult = calculateDevTestingMetrics(transitions, workItem.id);
 
-      // DEBUG: Log DEV testing metrics
-      if (devTestingResult.debugCycles.length > 0 || devTestingResult.debugIterations.length > 0) {
-        debugLog('TEST_METRIC', {
-          workItemId: workItem.id,
-          environment: 'DEV',
-          cycles: devTestingResult.debugCycles,
-          iterationDecisions: devTestingResult.debugIterations,
-          totalTestingHours: Math.round(
-            Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
-          ) / 100,
-        });
-      }
-
       for (const [tester, data] of devTestingResult.metrics) {
         if (!testerData.has(tester)) {
           testerData.set(tester, {
@@ -949,19 +968,6 @@ serve(async (req) => {
       // Calculate STG testing metrics
       const stgTestingResult = calculateStgTestingMetrics(transitions, workItem.id);
 
-      // DEBUG: Log STG testing metrics
-      if (stgTestingResult.debugCycles.length > 0 || stgTestingResult.debugIterations.length > 0) {
-        debugLog('TEST_METRIC', {
-          workItemId: workItem.id,
-          environment: 'STG',
-          cycles: stgTestingResult.debugCycles,
-          iterationDecisions: stgTestingResult.debugIterations,
-          totalTestingHours: Math.round(
-            Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
-          ) / 100,
-        });
-      }
-
       for (const [tester, data] of stgTestingResult.metrics) {
         if (!testerData.has(tester)) {
           testerData.set(tester, {
@@ -989,48 +995,62 @@ serve(async (req) => {
         }
       }
 
-      // DEBUG: Log work item summary
-      debugLog('SUMMARY', {
+      // Emit structured debug log for this work item (grouped by workItemId)
+      const debugLog: WorkItemDebugLog = {
         workItemId: workItem.id,
         type: workItemType,
         finalState,
-        devTimeHours: Math.round(devTimeResult.totalHours * 100) / 100,
-        devTestingHours: Math.round(
-          Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
-        ) / 100,
-        stgTestingHours: Math.round(
-          Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
-        ) / 100,
-        totalReturns: returns.codeReviewReturns + returns.devTestingReturns + returns.stgTestingReturns,
-        devIterations: Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.iterations, 0),
-        stgIterations: Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.iterations, 0),
-      });
+        transitions: transitions.map(t => ({
+          fromState: t.fromState,
+          toState: t.toState,
+          changedDate: t.timestamp.toISOString(),
+          assignedTo: t.assignedTo,
+          changedBy: t.changedBy,
+        })),
+        development: {
+          activePeriods: devTimeResult.debugPeriods,
+          totalActiveHours: Math.round(devTimeResult.totalHours * 100) / 100,
+          participatesInDevAvg: devTimeResult.totalHours > 0,
+          reason: devTimeResult.totalHours > 0 
+            ? `Has ${devTimeResult.cycles} development cycle(s)` 
+            : 'No completed Active periods found',
+        },
+        devTesting: {
+          cycles: devTestingResult.debugCycles,
+          iterations: devTestingResult.debugIterations,
+          totalTestingHours: Math.round(
+            Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
+          ) / 100,
+        },
+        stgTesting: {
+          cycles: stgTestingResult.debugCycles,
+          iterations: stgTestingResult.debugIterations,
+          totalTestingHours: Math.round(
+            Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
+          ) / 100,
+        },
+        returns: returns.debugReturns,
+        prComments: [], // Will be filled later if this item has PRs
+      };
+      
+      // Store the debug log for later PR comment merging
+      prDebugByWorkItem.set(workItem.id, []);
+      
+      // Emit the debug log (without PR comments for now - those come later)
+      emitWorkItemDebugLog(debugLog);
     }
 
     // Process all items (including Tasks) for PR comments - strictly by author
     for (const workItem of prItems) {
       const { commentsByAuthor, prCount, debugComments } = await getPRComments(organization, project, workItem, pat);
       
-      // DEBUG: Log PR comments
+      // Emit PR debug log for this work item if there are comments
       if (debugComments.length > 0) {
-        const commentSummary: Record<string, { counted: number; notCounted: number }> = {};
-        for (const c of debugComments) {
-          if (!commentSummary[c.author]) {
-            commentSummary[c.author] = { counted: 0, notCounted: 0 };
-          }
-          if (c.counted) {
-            commentSummary[c.author].counted++;
-          } else {
-            commentSummary[c.author].notCounted++;
-          }
-        }
-        
-        debugLog('PR', {
+        console.log('[PR_COMMENTS_DEBUG]', JSON.stringify({
           workItemId: workItem.id,
           prCount,
-          commentDetails: debugComments,
-          summary: commentSummary,
-        });
+          comments: debugComments,
+        }, null, 2));
       }
       
       for (const [author, count] of commentsByAuthor) {
@@ -1044,8 +1064,8 @@ serve(async (req) => {
       }
     }
 
-    // DEBUG: Log final averaging info
-    debugLog('AVERAGING', {
+    // Log final averaging info
+    console.log('[AVERAGING_SUMMARY]', JSON.stringify({
       numTasksForAverage: numTasks,
       globalDevTotalHours: Math.round(globalDevTotalHours * 100) / 100,
       globalDevTestingTotalHours: Math.round(globalDevTestingTotalHours * 100) / 100,
@@ -1053,7 +1073,7 @@ serve(async (req) => {
       avgDevTimeHours: numTasks > 0 ? Math.round((globalDevTotalHours / numTasks) * 100) / 100 : 0,
       avgDevTestTimeHours: numTasks > 0 ? Math.round((globalDevTestingTotalHours / numTasks) * 100) / 100 : 0,
       avgStgTestTimeHours: numTasks > 0 ? Math.round((globalStgTestingTotalHours / numTasks) * 100) / 100 : 0,
-    });
+    }, null, 2));
 
     // Build developer metrics array with per-task averages
     const developerMetrics: DeveloperMetrics[] = Array.from(developerData.entries())
