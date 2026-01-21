@@ -14,12 +14,13 @@ const STATES = {
   STG_IN_TESTING: 'STG_In Testing',
   DEV_ACCEPTANCE_TESTING: 'DEV_Acceptance Testing',
   STG_ACCEPTANCE_TESTING: 'STG_Acceptance Testing',
+  DEV_APPROVED: 'DEV_Approved', // Added missing state
   APPROVED: 'Approved',
   READY_FOR_RELEASE: 'Ready For Release',
   RELEASED: 'Released',
 } as const;
 
-// Structured debug log for a single work item - grouped by workItemId
+// Enhanced debug interfaces for manual validation
 interface TestingPeriod {
   start: string;
   end: string;
@@ -27,12 +28,14 @@ interface TestingPeriod {
 }
 
 interface TestingCycleDebug {
+  cycleIndex: number;
+  env: 'DEV' | 'STG';
   tester: string;
   cycleStart: string;
   cycleEnd: string;
   endReason: string;
-  totalHours: number;
-  periods: TestingPeriod[]; // All In Testing periods merged into this cycle
+  totalCycleHours: number;
+  mergedPeriods: TestingPeriod[];
   iterationCounted: boolean;
   iterationReason: string;
 }
@@ -42,11 +45,11 @@ interface WorkItemDebugLog {
   type: string;
   finalState: string;
   transitions: Array<{
+    timestamp: string;
     fromState: string;
     toState: string;
-    changedDate: string;
-    assignedTo: string | null;
     changedBy: string | null;
+    assignedTo: string | null;
   }>;
   development: {
     activePeriods: Array<{
@@ -82,6 +85,13 @@ interface WorkItemDebugLog {
     counted: boolean;
     reason: string;
   }>;
+  aggregation: {
+    taskDevTestingTotalHours: number;
+    taskStgTestingTotalHours: number;
+    taskDevIterations: number;
+    taskStgIterations: number;
+    includedInAverages: boolean;
+  };
 }
 
 function emitWorkItemDebugLog(log: WorkItemDebugLog) {
@@ -106,19 +116,18 @@ interface TransitionEvent {
   timestamp: Date;
   workItemId: number;
   assignedTo: string | null;
-  changedBy: string | null; // Person who performed the transition
+  changedBy: string | null;
 }
 
 interface DeveloperMetrics {
   developer: string;
-  avgDevTimeHours: number; // Renamed from developmentSpeedHours
+  avgDevTimeHours: number;
   developmentCycles: number;
   totalReturnCount: number;
   codeReviewReturns: number;
   devTestingReturns: number;
   stgTestingReturns: number;
   itemsCompleted: number;
-  // New per-task averages
   avgTotalReturnsPerTask: number;
   avgCodeReviewReturnsPerTask: number;
   avgDevTestingReturnsPerTask: number;
@@ -128,19 +137,18 @@ interface DeveloperMetrics {
 interface TesterMetrics {
   tester: string;
   closedItemsCount: number;
-  avgDevTestTimeHours: number; // Renamed from avgDevTestingSpeedHours
-  avgStgTestTimeHours: number; // Renamed from avgStgTestingSpeedHours
+  avgDevTestTimeHours: number;
+  avgStgTestTimeHours: number;
   devTestingCycles: number;
   stgTestingCycles: number;
   devTestingIterations: number;
   stgTestingIterations: number;
   prCommentsCount: number;
-  // New per-task averages
   avgDevIterationsPerTask: number;
   avgStgIterationsPerTask: number;
   avgPrCommentsPerPr: number;
-  tasksWorkedOn: number; // Track number of unique tasks for averages
-  prsReviewed: number; // Track number of PRs for avg comments
+  tasksWorkedOn: number;
+  prsReviewed: number;
 }
 
 interface PRCommentAuthor {
@@ -199,7 +207,6 @@ async function getWorkItems(
 ): Promise<WorkItem[]> {
   if (ids.length === 0) return [];
 
-  // Azure DevOps limits to 200 IDs per request
   const batchSize = 200;
   const allWorkItems: WorkItem[] = [];
 
@@ -267,14 +274,6 @@ function extractTransitions(revisions: WorkItemRevision[], workItemId: number): 
 
 /**
  * Calculate development time: SUM of ALL Active periods until first DEV_Acceptance Testing
- * 
- * Rules:
- * - Sum ALL periods when task is in Active state
- * - Stop counting after first transition into DEV_Acceptance Testing
- * - Final average = totalActiveTime / numberOfTasks (NOT divided by cycles)
- * - Attribute each cycle to the developer assigned at the moment the cycle ENDS
- * 
- * Returns: { totalHours, cycles, developerCycles: Map<developer, { totalHours, cycles }>, debugPeriods: array }
  */
 function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: number): {
   totalHours: number;
@@ -291,17 +290,14 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
   let stoppedAtAcceptance = false;
 
   for (const t of transitions) {
-    // Transition INTO Active starts a new development cycle
     if (t.toState === STATES.ACTIVE) {
       activeStartTimestamp = t.timestamp;
     }
-    // Transition to Code Review ends the current Active cycle
     else if (t.toState === STATES.CODE_REVIEW && activeStartTimestamp) {
       const hours = (t.timestamp.getTime() - activeStartTimestamp.getTime()) / (1000 * 60 * 60);
       totalHours += hours;
       cycles++;
 
-      // Attribute to developer who was assigned when the cycle ends
       const developer = t.assignedTo || 'Unassigned';
       if (!developerCycles.has(developer)) {
         developerCycles.set(developer, { totalHours: 0, cycles: 0 });
@@ -310,7 +306,6 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
       devData.totalHours += hours;
       devData.cycles++;
 
-      // Debug: record period with close reason
       debugPeriods.push({
         start: activeStartTimestamp.toISOString(),
         end: t.timestamp.toISOString(),
@@ -321,17 +316,12 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
 
       activeStartTimestamp = null;
     }
-    // Transition to DEV_Acceptance Testing:
-    // - If there's an open Active cycle, close it (handles skipped Code Review)
-    // - Stop processing development cycles after this point
     else if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
       if (activeStartTimestamp) {
-        // Active → DEV_Acceptance Testing (Code Review skipped)
         const hours = (t.timestamp.getTime() - activeStartTimestamp.getTime()) / (1000 * 60 * 60);
         totalHours += hours;
         cycles++;
 
-        // Attribute to developer assigned at end of cycle
         const developer = t.assignedTo || 'Unassigned';
         if (!developerCycles.has(developer)) {
           developerCycles.set(developer, { totalHours: 0, cycles: 0 });
@@ -340,7 +330,6 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
         devData.totalHours += hours;
         devData.cycles++;
 
-        // Debug: record period with close reason
         debugPeriods.push({
           start: activeStartTimestamp.toISOString(),
           end: t.timestamp.toISOString(),
@@ -351,7 +340,6 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
 
         activeStartTimestamp = null;
       }
-      // Stop processing - development phase ends at first DEV_Acceptance Testing
       stoppedAtAcceptance = true;
       break;
     }
@@ -362,10 +350,6 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
 
 /**
  * Count returns to Fix Required
- * 
- * Keep the current simplified logic:
- * - Attribute returns based on the last known developer
- * - Track separate counts for Code Review, DEV Testing, and STG Testing returns
  */
 function countReturns(transitions: TransitionEvent[], workItemId: number): {
   codeReviewReturns: number;
@@ -380,11 +364,9 @@ function countReturns(transitions: TransitionEvent[], workItemId: number): {
   const returnsByDeveloper = new Map<string, { codeReview: number; devTesting: number; stgTesting: number }>();
   const debugReturns: Array<{ fromState: string; toState: string; developer: string; type: string }> = [];
 
-  // Track the last known developer (from development cycle completions)
   let lastKnownDeveloper: string | null = null;
 
   for (const t of transitions) {
-    // Track developer from Active → Code Review or Active → DEV_Acceptance Testing transitions
     if (t.fromState === STATES.ACTIVE && 
         (t.toState === STATES.CODE_REVIEW || t.toState === STATES.DEV_ACCEPTANCE_TESTING)) {
       lastKnownDeveloper = t.assignedTo;
@@ -403,17 +385,16 @@ function countReturns(transitions: TransitionEvent[], workItemId: number): {
         codeReviewReturns++;
         devReturns.codeReview++;
         returnType = 'Code Review';
-      } else if (t.fromState === STATES.DEV_IN_TESTING) {
+      } else if (t.fromState === STATES.DEV_IN_TESTING || t.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
         devTestingReturns++;
         devReturns.devTesting++;
         returnType = 'DEV Testing';
-      } else if (t.fromState === STATES.STG_IN_TESTING) {
+      } else if (t.fromState === STATES.STG_IN_TESTING || t.fromState === STATES.STG_ACCEPTANCE_TESTING) {
         stgTestingReturns++;
         devReturns.stgTesting++;
         returnType = 'STG Testing';
       }
 
-      // Debug: record return
       debugReturns.push({
         fromState: t.fromState,
         toState: t.toState,
@@ -427,62 +408,59 @@ function countReturns(transitions: TransitionEvent[], workItemId: number): {
 }
 
 /**
- * Calculate DEV testing metrics with proper cycle merging and tester attribution
+ * Calculate DEV testing metrics with proper cycle closing logic
  * 
- * CORRECTED RULES:
+ * CYCLE CLOSING RULES for DEV:
+ * - DEV_In Testing → Fix Required
+ * - DEV_In Testing → DEV_Approved
+ * - DEV_In Testing → Ready for Release
+ * - DEV_In Testing → DEV_Acceptance Testing (only if next In Testing is by different tester)
+ * - DEV_Acceptance Testing → Fix Required
+ * - DEV_Acceptance Testing → DEV_Approved
+ * - DEV_Acceptance Testing → Ready for Release
  * 
- * Cycle Start:
- * - Each transition Acceptance Testing → In Testing starts a potential new cycle
- * 
- * Cycle Merging (same iteration):
- * - If In Testing → Acceptance AND next Acceptance → In Testing is by SAME tester:
- *   - Merge both In Testing periods into ONE cycle
- *   - Sum the time of both periods
- *   - Count as ONE iteration
- * 
- * Cycle Close (ends iteration):
- * - In Testing → Fix Required
- * - In Testing → Approved  
- * - In Testing → Ready for Release
- * - In Testing → Acceptance, and next In Testing is by DIFFERENT tester
- * - Acceptance → Fix Required (even without In Testing)
- * 
- * Iteration = one completed testing cycle
- * 
- * Avg Test Time = sum(all In Testing hours across all tasks) / numberOfTasks
+ * CYCLE MERGING:
+ * - In Testing → Acceptance → In Testing (same tester) = merge periods into one cycle
  */
 function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
   metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
   debugCycles: TestingCycleDebug[];
   totalIterations: number;
+  totalTestingHours: number;
 } {
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
   const debugCycles: TestingCycleDebug[] = [];
   
-  // Track current cycle state
+  // States that close a DEV testing cycle
+  const DEV_CYCLE_CLOSING_STATES = [
+    STATES.FIX_REQUIRED,
+    STATES.DEV_APPROVED,
+    STATES.READY_FOR_RELEASE,
+  ];
+  
   let currentCycle: {
     tester: string;
     cycleStart: Date;
     periods: Array<{ start: Date; end: Date | null; hours: number }>;
     inAcceptance: boolean;
-    lastInTestingEnd: Date | null;
   } | null = null;
   
   let totalIterations = 0;
+  let totalTestingHours = 0;
+  let cycleIndex = 0;
   
-  // Pre-process: Look ahead to determine if an Acceptance → In Testing transition is by same/different tester
+  // Pre-process: Look ahead to determine if next In Testing transition is by same/different tester
   const transitionsWithLookahead: Array<TransitionEvent & { nextInTestingTester?: string }> = transitions.map((t, i) => {
     const result = { ...t, nextInTestingTester: undefined as string | undefined };
     
-    // If this is a transition to Acceptance, find the next In Testing transition
     if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
       for (let j = i + 1; j < transitions.length; j++) {
         if (transitions[j].toState === STATES.DEV_IN_TESTING) {
           result.nextInTestingTester = transitions[j].changedBy || transitions[j].assignedTo || 'Unknown';
           break;
         }
-        // If we hit a cycle-closing state before In Testing, stop looking
-        if ([STATES.FIX_REQUIRED, STATES.APPROVED, STATES.READY_FOR_RELEASE].includes(transitions[j].toState as any)) {
+        // Stop looking if we hit a cycle-closing state
+        if (DEV_CYCLE_CLOSING_STATES.includes(transitions[j].toState as any)) {
           break;
         }
       }
@@ -500,29 +478,34 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
       lastPeriod.hours = (endTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
     }
     
-    // Calculate total hours for this cycle
-    const totalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
+    // Calculate total hours for this cycle (sum of all merged periods)
+    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
     
     // Update tester metrics
     if (!testerMetrics.has(currentCycle.tester)) {
       testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
     }
     const data = testerMetrics.get(currentCycle.tester)!;
-    data.totalHours += totalHours;
+    data.totalHours += cycleTotalHours;
     data.cycles++;
     if (iterationCounted) {
       data.iterations++;
       totalIterations++;
     }
+    totalTestingHours += cycleTotalHours;
     
-    // Debug log
+    cycleIndex++;
+    
+    // Debug log with enhanced structure
     debugCycles.push({
+      cycleIndex,
+      env: 'DEV',
       tester: currentCycle.tester,
       cycleStart: currentCycle.cycleStart.toISOString(),
       cycleEnd: endTime.toISOString(),
       endReason,
-      totalHours: Math.round(totalHours * 100) / 100,
-      periods: currentCycle.periods.map(p => ({
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+      mergedPeriods: currentCycle.periods.map(p => ({
         start: p.start.toISOString(),
         end: p.end?.toISOString() || endTime.toISOString(),
         hours: Math.round(p.hours * 100) / 100,
@@ -530,6 +513,17 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
       iterationCounted,
       iterationReason,
     });
+    
+    console.log('[DEV_CYCLE_CLOSED]', JSON.stringify({
+      workItemId,
+      cycleIndex,
+      tester: currentCycle.tester,
+      endReason,
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+      periodsCount: currentCycle.periods.length,
+      iterationCounted,
+      iterationReason,
+    }));
     
     currentCycle = null;
   }
@@ -541,9 +535,19 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
     if (t.toState === STATES.DEV_IN_TESTING) {
       const currentTester = t.changedBy || t.assignedTo || 'Unknown';
       
+      console.log('[DEV_TRANSITION]', JSON.stringify({
+        workItemId,
+        event: 'TO_IN_TESTING',
+        fromState: t.fromState,
+        tester: currentTester,
+        timestamp: t.timestamp.toISOString(),
+        hasCycle: !!currentCycle,
+        cycleInAcceptance: currentCycle?.inAcceptance,
+        cycleTester: currentCycle?.tester,
+      }));
+      
       if (currentCycle && currentCycle.inAcceptance && currentCycle.tester === currentTester) {
         // SAME tester returning from Acceptance - MERGE into existing cycle
-        // Just add a new In Testing period to the existing cycle
         currentCycle.periods.push({
           start: t.timestamp,
           end: null,
@@ -551,21 +555,19 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
         });
         currentCycle.inAcceptance = false;
         
-        console.log('[DEV_TESTING_DEBUG]', JSON.stringify({
+        console.log('[DEV_CYCLE_MERGE]', JSON.stringify({
           workItemId,
-          event: 'MERGE_PERIOD',
           tester: currentTester,
-          reason: 'Same tester returning from Acceptance - merging into existing cycle',
+          reason: 'Same tester returning from Acceptance',
           periodsCount: currentCycle.periods.length,
         }));
       } else {
         // DIFFERENT tester or no existing cycle - close previous and start new
         if (currentCycle) {
-          // Close previous cycle
           const endReason = currentCycle.inAcceptance 
-            ? 'Different tester took over from Acceptance' 
+            ? 'Tester Changed (different tester took over from Acceptance)' 
             : 'New cycle started by different tester';
-          closeCycle(t.timestamp, endReason, true, 'Cycle closed, iteration counted');
+          closeCycle(t.timestamp, endReason, true, 'Cycle closed before new tester, iteration counted');
         }
         
         // Start new cycle
@@ -574,123 +576,111 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
           cycleStart: t.timestamp,
           periods: [{ start: t.timestamp, end: null, hours: 0 }],
           inAcceptance: false,
-          lastInTestingEnd: null,
         };
         
-        console.log('[DEV_TESTING_DEBUG]', JSON.stringify({
+        console.log('[DEV_CYCLE_START]', JSON.stringify({
           workItemId,
-          event: 'NEW_CYCLE',
           tester: currentTester,
+          cycleStart: t.timestamp.toISOString(),
           fromState: t.fromState,
         }));
       }
     }
-    // Transition FROM DEV_In Testing TO Acceptance
+    // Transition FROM DEV_In Testing TO DEV_Acceptance Testing
     else if (t.fromState === STATES.DEV_IN_TESTING && t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
       if (currentCycle) {
-        // Close the current In Testing period but keep the cycle open
+        // Close the current In Testing period but potentially keep cycle open
         const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
         if (lastPeriod && lastPeriod.end === null) {
           lastPeriod.end = t.timestamp;
           lastPeriod.hours = (t.timestamp.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
         }
         currentCycle.inAcceptance = true;
-        currentCycle.lastInTestingEnd = t.timestamp;
         
         // Check if next In Testing is by different tester - if so, close cycle now
         if (t.nextInTestingTester && t.nextInTestingTester !== currentCycle.tester) {
-          closeCycle(t.timestamp, 'Handed off to different tester via Acceptance', true, 'Cycle closed before handoff, iteration counted');
+          closeCycle(t.timestamp, 'Tester Changed (handed off to different tester)', true, 'Cycle closed before handoff, iteration counted');
         }
         
-        console.log('[DEV_TESTING_DEBUG]', JSON.stringify({
+        console.log('[DEV_TO_ACCEPTANCE]', JSON.stringify({
           workItemId,
-          event: 'TO_ACCEPTANCE',
-          tester: currentCycle.tester,
+          tester: currentCycle?.tester,
           periodHours: lastPeriod?.hours ? Math.round(lastPeriod.hours * 100) / 100 : 0,
           nextTester: t.nextInTestingTester || 'unknown',
-          willMerge: t.nextInTestingTester === currentCycle.tester,
+          willClose: t.nextInTestingTester && t.nextInTestingTester !== currentCycle?.tester,
         }));
       }
     }
-    // Cycle-closing transitions FROM In Testing
-    else if (currentCycle && t.fromState === STATES.DEV_IN_TESTING && 
-             [STATES.FIX_REQUIRED, STATES.APPROVED, STATES.READY_FOR_RELEASE].includes(t.toState as any)) {
-      closeCycle(t.timestamp, `Transition to ${t.toState}`, true, 'Cycle completed, iteration counted');
+    // Cycle-closing transitions FROM DEV_In Testing
+    else if (currentCycle && t.fromState === STATES.DEV_IN_TESTING && DEV_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
+      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle completed with ${t.toState}, iteration counted`);
     }
-    // Cycle-closing transitions FROM Acceptance (without going through In Testing again)
+    // Cycle-closing transitions FROM DEV_Acceptance Testing
     else if (currentCycle && currentCycle.inAcceptance && 
              t.fromState === STATES.DEV_ACCEPTANCE_TESTING &&
-             [STATES.FIX_REQUIRED, STATES.APPROVED, STATES.READY_FOR_RELEASE].includes(t.toState as any)) {
-      closeCycle(t.timestamp, `Transition from Acceptance to ${t.toState}`, true, 'Cycle closed from Acceptance, iteration counted');
+             DEV_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
+      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle closed from Acceptance with ${t.toState}, iteration counted`);
     }
   }
   
-  // Close any remaining open cycle at the end
+  // Close any remaining open cycle at the end (not completed = no iteration)
   if (currentCycle) {
     const lastTransition = transitions[transitions.length - 1];
-    closeCycle(lastTransition?.timestamp || new Date(), 'End of transitions (cycle still open)', false, 'Cycle not completed, iteration not counted');
+    closeCycle(lastTransition?.timestamp || new Date(), 'End of transitions (cycle incomplete)', false, 'Cycle not completed, no closing transition');
   }
   
-  return { metrics: testerMetrics, debugCycles, totalIterations };
+  return { metrics: testerMetrics, debugCycles, totalIterations, totalTestingHours };
 }
 
 /**
- * Calculate STG testing metrics with proper cycle merging and tester attribution
+ * Calculate STG testing metrics with proper cycle closing logic
  * 
- * CORRECTED RULES (same as DEV but for STG states):
+ * CYCLE CLOSING RULES for STG:
+ * - STG_In Testing → Fix Required
+ * - STG_In Testing → Ready for Release
+ * - STG_In Testing → STG_Acceptance Testing (only if next In Testing is by different tester)
+ * - STG_Acceptance Testing → Fix Required
+ * - STG_Acceptance Testing → Ready for Release
  * 
- * Cycle Start:
- * - Each transition Acceptance Testing → In Testing starts a potential new cycle
- * 
- * Cycle Merging (same iteration):
- * - If In Testing → Acceptance AND next Acceptance → In Testing is by SAME tester:
- *   - Merge both In Testing periods into ONE cycle
- *   - Sum the time of both periods
- *   - Count as ONE iteration
- * 
- * Cycle Close (ends iteration):
- * - In Testing → Fix Required
- * - In Testing → Approved  
- * - In Testing → Ready for Release
- * - In Testing → Acceptance, and next In Testing is by DIFFERENT tester
- * - Acceptance → Fix Required (even without In Testing)
- * 
- * Iteration = one completed testing cycle
- * 
- * Avg Test Time = sum(all In Testing hours across all tasks) / numberOfTasks
+ * Note: STG does NOT close on Approved (only DEV does)
  */
 function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
   metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
   debugCycles: TestingCycleDebug[];
   totalIterations: number;
+  totalTestingHours: number;
 } {
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
   const debugCycles: TestingCycleDebug[] = [];
   
-  // Track current cycle state
+  // States that close a STG testing cycle (no Approved for STG)
+  const STG_CYCLE_CLOSING_STATES = [
+    STATES.FIX_REQUIRED,
+    STATES.READY_FOR_RELEASE,
+  ];
+  
   let currentCycle: {
     tester: string;
     cycleStart: Date;
     periods: Array<{ start: Date; end: Date | null; hours: number }>;
     inAcceptance: boolean;
-    lastInTestingEnd: Date | null;
   } | null = null;
   
   let totalIterations = 0;
+  let totalTestingHours = 0;
+  let cycleIndex = 0;
   
-  // Pre-process: Look ahead to determine if an Acceptance → In Testing transition is by same/different tester
+  // Pre-process: Look ahead to determine if next In Testing transition is by same/different tester
   const transitionsWithLookahead: Array<TransitionEvent & { nextInTestingTester?: string }> = transitions.map((t, i) => {
     const result = { ...t, nextInTestingTester: undefined as string | undefined };
     
-    // If this is a transition to Acceptance, find the next In Testing transition
     if (t.toState === STATES.STG_ACCEPTANCE_TESTING) {
       for (let j = i + 1; j < transitions.length; j++) {
         if (transitions[j].toState === STATES.STG_IN_TESTING) {
           result.nextInTestingTester = transitions[j].changedBy || transitions[j].assignedTo || 'Unknown';
           break;
         }
-        // If we hit a cycle-closing state before In Testing, stop looking
-        if ([STATES.FIX_REQUIRED, STATES.APPROVED, STATES.READY_FOR_RELEASE].includes(transitions[j].toState as any)) {
+        if (STG_CYCLE_CLOSING_STATES.includes(transitions[j].toState as any)) {
           break;
         }
       }
@@ -701,36 +691,37 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
   function closeCycle(endTime: Date, endReason: string, iterationCounted: boolean, iterationReason: string) {
     if (!currentCycle) return;
     
-    // Close any open In Testing period
     const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
     if (lastPeriod && lastPeriod.end === null) {
       lastPeriod.end = endTime;
       lastPeriod.hours = (endTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
     }
     
-    // Calculate total hours for this cycle
-    const totalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
+    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
     
-    // Update tester metrics
     if (!testerMetrics.has(currentCycle.tester)) {
       testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
     }
     const data = testerMetrics.get(currentCycle.tester)!;
-    data.totalHours += totalHours;
+    data.totalHours += cycleTotalHours;
     data.cycles++;
     if (iterationCounted) {
       data.iterations++;
       totalIterations++;
     }
+    totalTestingHours += cycleTotalHours;
     
-    // Debug log
+    cycleIndex++;
+    
     debugCycles.push({
+      cycleIndex,
+      env: 'STG',
       tester: currentCycle.tester,
       cycleStart: currentCycle.cycleStart.toISOString(),
       cycleEnd: endTime.toISOString(),
       endReason,
-      totalHours: Math.round(totalHours * 100) / 100,
-      periods: currentCycle.periods.map(p => ({
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+      mergedPeriods: currentCycle.periods.map(p => ({
         start: p.start.toISOString(),
         end: p.end?.toISOString() || endTime.toISOString(),
         hours: Math.round(p.hours * 100) / 100,
@@ -739,19 +730,38 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
       iterationReason,
     });
     
+    console.log('[STG_CYCLE_CLOSED]', JSON.stringify({
+      workItemId,
+      cycleIndex,
+      tester: currentCycle.tester,
+      endReason,
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+      periodsCount: currentCycle.periods.length,
+      iterationCounted,
+      iterationReason,
+    }));
+    
     currentCycle = null;
   }
   
   for (let i = 0; i < transitionsWithLookahead.length; i++) {
     const t = transitionsWithLookahead[i];
     
-    // Transition INTO STG_In Testing
     if (t.toState === STATES.STG_IN_TESTING) {
       const currentTester = t.changedBy || t.assignedTo || 'Unknown';
       
+      console.log('[STG_TRANSITION]', JSON.stringify({
+        workItemId,
+        event: 'TO_IN_TESTING',
+        fromState: t.fromState,
+        tester: currentTester,
+        timestamp: t.timestamp.toISOString(),
+        hasCycle: !!currentCycle,
+        cycleInAcceptance: currentCycle?.inAcceptance,
+        cycleTester: currentCycle?.tester,
+      }));
+      
       if (currentCycle && currentCycle.inAcceptance && currentCycle.tester === currentTester) {
-        // SAME tester returning from Acceptance - MERGE into existing cycle
-        // Just add a new In Testing period to the existing cycle
         currentCycle.periods.push({
           start: t.timestamp,
           end: null,
@@ -759,92 +769,77 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
         });
         currentCycle.inAcceptance = false;
         
-        console.log('[STG_TESTING_DEBUG]', JSON.stringify({
+        console.log('[STG_CYCLE_MERGE]', JSON.stringify({
           workItemId,
-          event: 'MERGE_PERIOD',
           tester: currentTester,
-          reason: 'Same tester returning from Acceptance - merging into existing cycle',
+          reason: 'Same tester returning from Acceptance',
           periodsCount: currentCycle.periods.length,
         }));
       } else {
-        // DIFFERENT tester or no existing cycle - close previous and start new
         if (currentCycle) {
-          // Close previous cycle
           const endReason = currentCycle.inAcceptance 
-            ? 'Different tester took over from Acceptance' 
+            ? 'Tester Changed (different tester took over from Acceptance)' 
             : 'New cycle started by different tester';
-          closeCycle(t.timestamp, endReason, true, 'Cycle closed, iteration counted');
+          closeCycle(t.timestamp, endReason, true, 'Cycle closed before new tester, iteration counted');
         }
         
-        // Start new cycle
         currentCycle = {
           tester: currentTester,
           cycleStart: t.timestamp,
           periods: [{ start: t.timestamp, end: null, hours: 0 }],
           inAcceptance: false,
-          lastInTestingEnd: null,
         };
         
-        console.log('[STG_TESTING_DEBUG]', JSON.stringify({
+        console.log('[STG_CYCLE_START]', JSON.stringify({
           workItemId,
-          event: 'NEW_CYCLE',
           tester: currentTester,
+          cycleStart: t.timestamp.toISOString(),
           fromState: t.fromState,
         }));
       }
     }
-    // Transition FROM STG_In Testing TO Acceptance
     else if (t.fromState === STATES.STG_IN_TESTING && t.toState === STATES.STG_ACCEPTANCE_TESTING) {
       if (currentCycle) {
-        // Close the current In Testing period but keep the cycle open
         const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
         if (lastPeriod && lastPeriod.end === null) {
           lastPeriod.end = t.timestamp;
           lastPeriod.hours = (t.timestamp.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
         }
         currentCycle.inAcceptance = true;
-        currentCycle.lastInTestingEnd = t.timestamp;
         
-        // Check if next In Testing is by different tester - if so, close cycle now
         if (t.nextInTestingTester && t.nextInTestingTester !== currentCycle.tester) {
-          closeCycle(t.timestamp, 'Handed off to different tester via Acceptance', true, 'Cycle closed before handoff, iteration counted');
+          closeCycle(t.timestamp, 'Tester Changed (handed off to different tester)', true, 'Cycle closed before handoff, iteration counted');
         }
         
-        console.log('[STG_TESTING_DEBUG]', JSON.stringify({
+        console.log('[STG_TO_ACCEPTANCE]', JSON.stringify({
           workItemId,
-          event: 'TO_ACCEPTANCE',
-          tester: currentCycle.tester,
+          tester: currentCycle?.tester,
           periodHours: lastPeriod?.hours ? Math.round(lastPeriod.hours * 100) / 100 : 0,
           nextTester: t.nextInTestingTester || 'unknown',
-          willMerge: t.nextInTestingTester === currentCycle.tester,
+          willClose: t.nextInTestingTester && t.nextInTestingTester !== currentCycle?.tester,
         }));
       }
     }
-    // Cycle-closing transitions FROM In Testing
-    else if (currentCycle && t.fromState === STATES.STG_IN_TESTING && 
-             [STATES.FIX_REQUIRED, STATES.APPROVED, STATES.READY_FOR_RELEASE].includes(t.toState as any)) {
-      closeCycle(t.timestamp, `Transition to ${t.toState}`, true, 'Cycle completed, iteration counted');
+    else if (currentCycle && t.fromState === STATES.STG_IN_TESTING && STG_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
+      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle completed with ${t.toState}, iteration counted`);
     }
-    // Cycle-closing transitions FROM Acceptance (without going through In Testing again)
     else if (currentCycle && currentCycle.inAcceptance && 
              t.fromState === STATES.STG_ACCEPTANCE_TESTING &&
-             [STATES.FIX_REQUIRED, STATES.APPROVED, STATES.READY_FOR_RELEASE].includes(t.toState as any)) {
-      closeCycle(t.timestamp, `Transition from Acceptance to ${t.toState}`, true, 'Cycle closed from Acceptance, iteration counted');
+             STG_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
+      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle closed from Acceptance with ${t.toState}, iteration counted`);
     }
   }
   
-  // Close any remaining open cycle at the end
   if (currentCycle) {
     const lastTransition = transitions[transitions.length - 1];
-    closeCycle(lastTransition?.timestamp || new Date(), 'End of transitions (cycle still open)', false, 'Cycle not completed, iteration not counted');
+    closeCycle(lastTransition?.timestamp || new Date(), 'End of transitions (cycle incomplete)', false, 'Cycle not completed, no closing transition');
   }
   
-  return { metrics: testerMetrics, debugCycles, totalIterations };
+  return { metrics: testerMetrics, debugCycles, totalIterations, totalTestingHours };
 }
 
 /**
- * Get PR comments from linked PRs - ONLY individual comments by the specific author
- * Do NOT count replies or comments from other users
+ * Get PR comments from linked PRs
  */
 async function getPRComments(
   organization: string,
@@ -864,15 +859,12 @@ async function getPRComments(
     return { commentsByAuthor, prCount, debugComments };
   }
   
-  // Find ArtifactLink relations that are Pull Requests
   const prLinks = workItem.relations.filter(
     r => r.rel === 'ArtifactLink' && r.url.includes('PullRequestId')
   );
   
   for (const link of prLinks) {
     try {
-      // Extract PR ID from the link URL
-      // Format: vstfs:///Git/PullRequestId/{project}%2F{repoId}%2F{prId}
       const match = link.url.match(/PullRequestId\/[^%]+%2F([^%]+)%2F(\d+)/);
       if (!match) continue;
       
@@ -880,25 +872,20 @@ async function getPRComments(
       const prId = match[2];
       prCount++;
       
-      // Get PR threads (comments)
       const threadsUrl = `https://dev.azure.com/${organization}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=7.1`;
       const threadsResult = await azureRequest(threadsUrl, pat) as { value: Array<{ comments: Array<{ author: { displayName: string }; parentCommentId?: number; commentType?: string }> }> };
       
       for (const thread of threadsResult.value || []) {
-        // Only count the FIRST comment in each thread (not replies)
-        // Replies have parentCommentId set
         for (const comment of thread.comments || []) {
           const author = comment.author?.displayName || 'Unknown';
           const isTopLevel = !comment.parentCommentId;
           const isSystem = comment.commentType === 'system';
 
-          // Skip replies (comments with parentCommentId)
           if (!isTopLevel) {
             debugComments.push({ prId, author, counted: false, reason: 'Reply (has parentCommentId)' });
             continue;
           }
           
-          // Skip system comments
           if (isSystem) {
             debugComments.push({ prId, author, counted: false, reason: 'System comment' });
             continue;
@@ -909,7 +896,6 @@ async function getPRComments(
         }
       }
     } catch {
-      // Skip this PR if we can't access it
       console.log(`Could not access PR for work item ${workItem.id}`);
     }
   }
@@ -918,7 +904,6 @@ async function getPRComments(
 }
 
 serve(async (req) => {
-  // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
@@ -926,14 +911,12 @@ serve(async (req) => {
   try {
     const { organization, project, queryId, pat } = await req.json();
 
-    // Validate inputs
     if (!organization || !project || !queryId || !pat) {
       throw new Error('Missing required fields: organization, project, queryId, pat');
     }
 
     console.log(`Starting analysis for ${organization}/${project}`);
 
-    // Step 1: Execute query to get work item IDs
     const workItemIds = await executeQuery(organization, project, queryId, pat);
     console.log(`Found ${workItemIds.length} work items`);
 
@@ -966,19 +949,18 @@ serve(async (req) => {
       );
     }
 
-    // Step 2: Get work items with relations
     const workItems = await getWorkItems(organization, project, workItemIds, pat);
-    console.log(`Retrieved ${workItems.length} work items with details`);
+    console.log(`Fetched ${workItems.length} work items with details`);
 
-    // Categorize work items
     const requirements = workItems.filter(wi => wi.fields['System.WorkItemType'] === 'Requirement');
     const bugs = workItems.filter(wi => wi.fields['System.WorkItemType'] === 'Bug');
     const tasks = workItems.filter(wi => wi.fields['System.WorkItemType'] === 'Task');
-    const metricsItems = [...requirements, ...bugs]; // Items for main metrics
-    const prItems = [...requirements, ...bugs, ...tasks]; // Items for PR comments
+    
+    const metricsItems = [...requirements, ...bugs];
+    const prItems = workItems;
 
-    // Step 3: Process each work item for metrics
-    // Developer data aggregation
+    console.log(`Processing ${requirements.length} requirements, ${bugs.length} bugs, ${tasks.length} tasks`);
+
     const developerData: Map<string, {
       totalDevHours: number;
       devCycles: number;
@@ -986,10 +968,9 @@ serve(async (req) => {
       devTestingReturns: number;
       stgTestingReturns: number;
       itemsCompleted: number;
-      tasksWorkedOn: Set<number>; // Track unique tasks for averaging
+      tasksWorkedOn: Set<number>;
     }> = new Map();
 
-    // Tester data aggregation
     const testerData: Map<string, {
       closedItems: Set<number>;
       totalDevTestingHours: number;
@@ -998,45 +979,33 @@ serve(async (req) => {
       stgTestingCycles: number;
       devIterations: number;
       stgIterations: number;
-      tasksWorkedOn: Set<number>; // Track unique tasks
-      prsReviewed: number; // Track PRs for avg comments
+      tasksWorkedOn: Set<number>;
+      prsReviewed: number;
     }> = new Map();
 
-    // All testers set - collected from TestedBy fields for PR comment filtering
     const allTesters = new Set<string>();
-
-    // PR comments aggregation - strictly by author
     const allPrComments: Map<string, number> = new Map();
-    // Track PRs per author for averaging
     const prCountByAuthor: Map<string, number> = new Map();
 
-    // Global totals for summary calculations
     let globalDevTotalHours = 0;
     let globalDevTestingTotalHours = 0;
     let globalStgTestingTotalHours = 0;
     const numTasks = metricsItems.length;
 
-    // Store PR debug logs by workItemId for later merging
-    const prDebugByWorkItem: Map<number, Array<{ prId: string; author: string; counted: boolean; reason: string }>> = new Map();
-
-    // Process Requirements and Bugs for metrics
     for (const workItem of metricsItems) {
       const revisions = await getWorkItemRevisions(organization, project, workItem.id, pat);
       const transitions = extractTransitions(revisions, workItem.id);
       const workItemType = workItem.fields['System.WorkItemType'] as string;
       const finalState = workItem.fields['System.State'] as string;
       
-      // Collect testers from TestedBy fields for PR comment filtering only
       const tester1 = getDisplayName(workItem.fields['Custom.TestedBy1']);
       const tester2 = getDisplayName(workItem.fields['Custom.TestedBy2']);
       if (tester1) allTesters.add(tester1);
       if (tester2) allTesters.add(tester2);
       
-      // Calculate development time with developer attribution at cycle end
       const devTimeResult = calculateDevelopmentTime(transitions, workItem.id);
       globalDevTotalHours += devTimeResult.totalHours;
 
-      // Update developer metrics from development cycles
       for (const [developer, data] of devTimeResult.developerCycles) {
         if (!developerData.has(developer)) {
           developerData.set(developer, {
@@ -1055,7 +1024,6 @@ serve(async (req) => {
         devData.tasksWorkedOn.add(workItem.id);
       }
       
-      // Count returns with developer attribution
       const returns = countReturns(transitions, workItem.id);
 
       for (const [developer, returnData] of returns.returnsByDeveloper) {
@@ -1077,7 +1045,6 @@ serve(async (req) => {
         devData.tasksWorkedOn.add(workItem.id);
       }
 
-      // Track completed items - attribute to the developer who did the most cycles
       if (workItem.fields['System.State'] === STATES.RELEASED) {
         let maxCyclesDev: string | null = null;
         let maxCycles = 0;
@@ -1092,8 +1059,9 @@ serve(async (req) => {
         }
       }
       
-      // Calculate DEV testing metrics
       const devTestingResult = calculateDevTestingMetrics(transitions, workItem.id);
+      const taskDevTestingTotalHours = devTestingResult.totalTestingHours;
+      const taskDevIterations = devTestingResult.totalIterations;
 
       for (const [tester, data] of devTestingResult.metrics) {
         if (!testerData.has(tester)) {
@@ -1114,16 +1082,16 @@ serve(async (req) => {
         testData.devTestingCycles += data.cycles;
         testData.devIterations += data.iterations;
         testData.tasksWorkedOn.add(workItem.id);
-        globalDevTestingTotalHours += data.totalHours;
         
-        // Track closed items for this tester
         if (workItem.fields['System.State'] === STATES.RELEASED) {
           testData.closedItems.add(workItem.id);
         }
       }
+      globalDevTestingTotalHours += taskDevTestingTotalHours;
 
-      // Calculate STG testing metrics
       const stgTestingResult = calculateStgTestingMetrics(transitions, workItem.id);
+      const taskStgTestingTotalHours = stgTestingResult.totalTestingHours;
+      const taskStgIterations = stgTestingResult.totalIterations;
 
       for (const [tester, data] of stgTestingResult.metrics) {
         if (!testerData.has(tester)) {
@@ -1144,25 +1112,24 @@ serve(async (req) => {
         testData.stgTestingCycles += data.cycles;
         testData.stgIterations += data.iterations;
         testData.tasksWorkedOn.add(workItem.id);
-        globalStgTestingTotalHours += data.totalHours;
         
-        // Track closed items for this tester
         if (workItem.fields['System.State'] === STATES.RELEASED) {
           testData.closedItems.add(workItem.id);
         }
       }
+      globalStgTestingTotalHours += taskStgTestingTotalHours;
 
-      // Emit structured debug log for this work item (grouped by workItemId)
+      // Emit structured debug log for this work item
       const debugLog: WorkItemDebugLog = {
         workItemId: workItem.id,
         type: workItemType,
         finalState,
         transitions: transitions.map(t => ({
+          timestamp: t.timestamp.toISOString(),
           fromState: t.fromState,
           toState: t.toState,
-          changedDate: t.timestamp.toISOString(),
-          assignedTo: t.assignedTo,
           changedBy: t.changedBy,
+          assignedTo: t.assignedTo,
         })),
         development: {
           activePeriods: devTimeResult.debugPeriods,
@@ -1174,34 +1141,32 @@ serve(async (req) => {
         },
         devTesting: {
           cycles: devTestingResult.debugCycles,
-          totalTestingHours: Math.round(
-            Array.from(devTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
-          ) / 100,
-          totalIterations: devTestingResult.totalIterations,
+          totalTestingHours: Math.round(taskDevTestingTotalHours * 100) / 100,
+          totalIterations: taskDevIterations,
         },
         stgTesting: {
           cycles: stgTestingResult.debugCycles,
-          totalTestingHours: Math.round(
-            Array.from(stgTestingResult.metrics.values()).reduce((sum, d) => sum + d.totalHours, 0) * 100
-          ) / 100,
-          totalIterations: stgTestingResult.totalIterations,
+          totalTestingHours: Math.round(taskStgTestingTotalHours * 100) / 100,
+          totalIterations: taskStgIterations,
         },
         returns: returns.debugReturns,
-        prComments: [], // Will be filled later if this item has PRs
+        prComments: [],
+        aggregation: {
+          taskDevTestingTotalHours: Math.round(taskDevTestingTotalHours * 100) / 100,
+          taskStgTestingTotalHours: Math.round(taskStgTestingTotalHours * 100) / 100,
+          taskDevIterations,
+          taskStgIterations,
+          includedInAverages: true,
+        },
       };
       
-      // Store the debug log for later PR comment merging
-      prDebugByWorkItem.set(workItem.id, []);
-      
-      // Emit the debug log (without PR comments for now - those come later)
       emitWorkItemDebugLog(debugLog);
     }
 
-    // Process all items (including Tasks) for PR comments - strictly by author
+    // Process all items for PR comments
     for (const workItem of prItems) {
       const { commentsByAuthor, prCount, debugComments } = await getPRComments(organization, project, workItem, pat);
       
-      // Emit PR debug log for this work item if there are comments
       if (debugComments.length > 0) {
         console.log('[PR_COMMENTS_DEBUG]', JSON.stringify({
           workItemId: workItem.id,
@@ -1214,7 +1179,6 @@ serve(async (req) => {
         allPrComments.set(author, (allPrComments.get(author) || 0) + count);
         prCountByAuthor.set(author, (prCountByAuthor.get(author) || 0) + prCount);
         
-        // Update tester's PR count if they exist
         if (testerData.has(author)) {
           testerData.get(author)!.prsReviewed += prCount;
         }
@@ -1232,40 +1196,28 @@ serve(async (req) => {
       avgStgTestTimeHours: numTasks > 0 ? Math.round((globalStgTestingTotalHours / numTasks) * 100) / 100 : 0,
     }, null, 2));
 
-    // Build developer metrics array with per-task averages
     const developerMetrics: DeveloperMetrics[] = Array.from(developerData.entries())
       .map(([developer, data]) => {
         const taskCount = data.tasksWorkedOn.size;
         return {
           developer,
-          // Avg Dev Time = totalHours / numberOfTasks (NOT cycles)
-          avgDevTimeHours: taskCount > 0
-            ? data.totalDevHours / taskCount
-            : 0,
+          avgDevTimeHours: taskCount > 0 ? data.totalDevHours / taskCount : 0,
           developmentCycles: data.devCycles,
           totalReturnCount: data.codeReviewReturns + data.devTestingReturns + data.stgTestingReturns,
           codeReviewReturns: data.codeReviewReturns,
           devTestingReturns: data.devTestingReturns,
           stgTestingReturns: data.stgTestingReturns,
           itemsCompleted: data.itemsCompleted,
-          // Per-task averages
           avgTotalReturnsPerTask: taskCount > 0
             ? (data.codeReviewReturns + data.devTestingReturns + data.stgTestingReturns) / taskCount
             : 0,
-          avgCodeReviewReturnsPerTask: taskCount > 0
-            ? data.codeReviewReturns / taskCount
-            : 0,
-          avgDevTestingReturnsPerTask: taskCount > 0
-            ? data.devTestingReturns / taskCount
-            : 0,
-          avgStgTestingReturnsPerTask: taskCount > 0
-            ? data.stgTestingReturns / taskCount
-            : 0,
+          avgCodeReviewReturnsPerTask: taskCount > 0 ? data.codeReviewReturns / taskCount : 0,
+          avgDevTestingReturnsPerTask: taskCount > 0 ? data.devTestingReturns / taskCount : 0,
+          avgStgTestingReturnsPerTask: taskCount > 0 ? data.stgTestingReturns / taskCount : 0,
         };
       })
       .sort((a, b) => b.itemsCompleted - a.itemsCompleted);
 
-    // Build tester metrics array with per-task averages
     const testerMetrics: TesterMetrics[] = Array.from(testerData.entries())
       .map(([tester, data]) => {
         const taskCount = data.tasksWorkedOn.size;
@@ -1275,35 +1227,22 @@ serve(async (req) => {
         return {
           tester,
           closedItemsCount: data.closedItems.size,
-          // Avg Test Time = totalHours / numberOfTasks (NOT cycles)
-          avgDevTestTimeHours: taskCount > 0
-            ? data.totalDevTestingHours / taskCount
-            : 0,
-          avgStgTestTimeHours: taskCount > 0
-            ? data.totalStgTestingHours / taskCount
-            : 0,
+          avgDevTestTimeHours: taskCount > 0 ? data.totalDevTestingHours / taskCount : 0,
+          avgStgTestTimeHours: taskCount > 0 ? data.totalStgTestingHours / taskCount : 0,
           devTestingCycles: data.devTestingCycles,
           stgTestingCycles: data.stgTestingCycles,
           devTestingIterations: data.devIterations,
           stgTestingIterations: data.stgIterations,
           prCommentsCount: commentCount,
-          // Per-task averages
-          avgDevIterationsPerTask: taskCount > 0
-            ? data.devIterations / taskCount
-            : 0,
-          avgStgIterationsPerTask: taskCount > 0
-            ? data.stgIterations / taskCount
-            : 0,
-          avgPrCommentsPerPr: prCount > 0
-            ? commentCount / prCount
-            : 0,
+          avgDevIterationsPerTask: taskCount > 0 ? data.devIterations / taskCount : 0,
+          avgStgIterationsPerTask: taskCount > 0 ? data.stgIterations / taskCount : 0,
+          avgPrCommentsPerPr: prCount > 0 ? commentCount / prCount : 0,
           tasksWorkedOn: taskCount,
           prsReviewed: prCount,
         };
       })
       .sort((a, b) => b.closedItemsCount - a.closedItemsCount);
 
-    // Build PR comment authors list with tester flag
     const prCommentAuthors: PRCommentAuthor[] = Array.from(allPrComments.entries())
       .map(([author, count]) => ({
         author,
@@ -1312,7 +1251,6 @@ serve(async (req) => {
       }))
       .sort((a, b) => b.count - a.count);
 
-    // Calculate summary using total duration / numberOfTasks
     const totalReturns = developerMetrics.reduce((sum, d) => sum + d.totalReturnCount, 0);
     const totalPrComments = Array.from(allPrComments.values()).reduce((sum, count) => sum + count, 0);
 
@@ -1321,21 +1259,13 @@ serve(async (req) => {
       totalRequirements: requirements.length,
       totalBugs: bugs.length,
       totalTasks: tasks.length,
-      // Avg = totalTime / numberOfTasks
-      avgDevTimeHours: numTasks > 0
-        ? globalDevTotalHours / numTasks
-        : 0,
-      avgDevTestTimeHours: numTasks > 0
-        ? globalDevTestingTotalHours / numTasks
-        : 0,
-      avgStgTestTimeHours: numTasks > 0
-        ? globalStgTestingTotalHours / numTasks
-        : 0,
+      avgDevTimeHours: numTasks > 0 ? globalDevTotalHours / numTasks : 0,
+      avgDevTestTimeHours: numTasks > 0 ? globalDevTestingTotalHours / numTasks : 0,
+      avgStgTestTimeHours: numTasks > 0 ? globalStgTestingTotalHours / numTasks : 0,
       totalReturns,
       totalPrComments,
     };
 
-    // Build chart data
     const chartData = {
       developmentSpeed: developerMetrics
         .filter(d => d.avgDevTimeHours > 0)
