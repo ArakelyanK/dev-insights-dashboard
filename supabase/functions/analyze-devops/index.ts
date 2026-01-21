@@ -14,10 +14,11 @@ const STATES = {
   STG_IN_TESTING: 'STG_In Testing',
   DEV_ACCEPTANCE_TESTING: 'DEV_Acceptance Testing',
   STG_ACCEPTANCE_TESTING: 'STG_Acceptance Testing',
-  DEV_APPROVED: 'DEV_Approved', // Added missing state
+  DEV_APPROVED: 'DEV_Approved',
   APPROVED: 'Approved',
   READY_FOR_RELEASE: 'Ready For Release',
   RELEASED: 'Released',
+  PAUSED: 'Paused',
 } as const;
 
 // Enhanced debug interfaces for manual validation
@@ -287,36 +288,11 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
   let totalHours = 0;
   let cycles = 0;
   let activeStartTimestamp: Date | null = null;
-  let stoppedAtAcceptance = false;
 
   for (const t of transitions) {
-    if (t.toState === STATES.ACTIVE) {
-      activeStartTimestamp = t.timestamp;
-    }
-    else if (t.toState === STATES.CODE_REVIEW && activeStartTimestamp) {
-      const hours = (t.timestamp.getTime() - activeStartTimestamp.getTime()) / (1000 * 60 * 60);
-      totalHours += hours;
-      cycles++;
-
-      const developer = t.assignedTo || 'Unassigned';
-      if (!developerCycles.has(developer)) {
-        developerCycles.set(developer, { totalHours: 0, cycles: 0 });
-      }
-      const devData = developerCycles.get(developer)!;
-      devData.totalHours += hours;
-      devData.cycles++;
-
-      debugPeriods.push({
-        start: activeStartTimestamp.toISOString(),
-        end: t.timestamp.toISOString(),
-        hoursAdded: Math.round(hours * 100) / 100,
-        closeReason: 'Transition to Code Review',
-        developer,
-      });
-
-      activeStartTimestamp = null;
-    }
-    else if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
+    // Check if we've reached DEV_Acceptance Testing - stop collecting Active periods
+    if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
+      // Close any open Active period first
       if (activeStartTimestamp) {
         const hours = (t.timestamp.getTime() - activeStartTimestamp.getTime()) / (1000 * 60 * 60);
         totalHours += hours;
@@ -340,12 +316,41 @@ function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: nu
 
         activeStartTimestamp = null;
       }
-      stoppedAtAcceptance = true;
-      break;
+      // Stop processing - we've reached first DEV_Acceptance Testing
+      return { totalHours, cycles, developerCycles, debugPeriods, stoppedAtAcceptance: true };
+    }
+
+    // Entering Active state
+    if (t.toState === STATES.ACTIVE) {
+      activeStartTimestamp = t.timestamp;
+    }
+    // Leaving Active state (to Code Review or any other state)
+    else if (t.fromState === STATES.ACTIVE && activeStartTimestamp) {
+      const hours = (t.timestamp.getTime() - activeStartTimestamp.getTime()) / (1000 * 60 * 60);
+      totalHours += hours;
+      cycles++;
+
+      const developer = t.assignedTo || 'Unassigned';
+      if (!developerCycles.has(developer)) {
+        developerCycles.set(developer, { totalHours: 0, cycles: 0 });
+      }
+      const devData = developerCycles.get(developer)!;
+      devData.totalHours += hours;
+      devData.cycles++;
+
+      debugPeriods.push({
+        start: activeStartTimestamp.toISOString(),
+        end: t.timestamp.toISOString(),
+        hoursAdded: Math.round(hours * 100) / 100,
+        closeReason: `Transition to ${t.toState}`,
+        developer,
+      });
+
+      activeStartTimestamp = null;
     }
   }
 
-  return { totalHours, cycles, developerCycles, debugPeriods, stoppedAtAcceptance };
+  return { totalHours, cycles, developerCycles, debugPeriods, stoppedAtAcceptance: false };
 }
 
 /**
@@ -408,19 +413,18 @@ function countReturns(transitions: TransitionEvent[], workItemId: number): {
 }
 
 /**
- * Calculate DEV testing metrics with proper cycle closing logic
+ * Calculate DEV testing metrics with corrected cycle logic
  * 
- * CYCLE CLOSING RULES for DEV:
- * - DEV_In Testing → Fix Required
- * - DEV_In Testing → DEV_Approved
- * - DEV_In Testing → Ready for Release
- * - DEV_In Testing → DEV_Acceptance Testing (only if next In Testing is by different tester)
- * - DEV_Acceptance Testing → Fix Required
- * - DEV_Acceptance Testing → DEV_Approved
- * - DEV_Acceptance Testing → Ready for Release
+ * CYCLE START: ANY → DEV_In Testing
+ * CYCLE END: ANY transition FROM DEV_In Testing
  * 
- * CYCLE MERGING:
- * - In Testing → Acceptance → In Testing (same tester) = merge periods into one cycle
+ * EXCEPTION (merge rule):
+ * - DEV_In Testing → DEV_Acceptance Testing → DEV_In Testing
+ * - Same tester (changedBy) on both In Testing transitions
+ * - No other states in between (only Acceptance)
+ * => Merge into ONE cycle, sum the In Testing periods
+ * 
+ * All other transitions from DEV_In Testing close the cycle
  */
 function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
   metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
@@ -431,54 +435,23 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
   const debugCycles: TestingCycleDebug[] = [];
   
-  // States that close a DEV testing cycle
-  const DEV_CYCLE_CLOSING_STATES = [
-    STATES.FIX_REQUIRED,
-    STATES.DEV_APPROVED,
-    STATES.READY_FOR_RELEASE,
-  ];
-  
   let currentCycle: {
     tester: string;
     cycleStart: Date;
-    periods: Array<{ start: Date; end: Date | null; hours: number }>;
-    inAcceptance: boolean;
+    inTestingStart: Date;
+    periods: Array<{ start: Date; end: Date; hours: number }>;
+    pendingMerge: boolean; // True when we're in Acceptance and might merge
+    pendingMergeEnd: Date | null;
   } | null = null;
   
   let totalIterations = 0;
   let totalTestingHours = 0;
   let cycleIndex = 0;
   
-  // Pre-process: Look ahead to determine if next In Testing transition is by same/different tester
-  const transitionsWithLookahead: Array<TransitionEvent & { nextInTestingTester?: string }> = transitions.map((t, i) => {
-    const result = { ...t, nextInTestingTester: undefined as string | undefined };
-    
-    if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
-      for (let j = i + 1; j < transitions.length; j++) {
-        if (transitions[j].toState === STATES.DEV_IN_TESTING) {
-          result.nextInTestingTester = transitions[j].changedBy || transitions[j].assignedTo || 'Unknown';
-          break;
-        }
-        // Stop looking if we hit a cycle-closing state
-        if (DEV_CYCLE_CLOSING_STATES.includes(transitions[j].toState as any)) {
-          break;
-        }
-      }
-    }
-    return result;
-  });
-  
-  function closeCycle(endTime: Date, endReason: string, iterationCounted: boolean, iterationReason: string) {
+  function closeCycle(endTime: Date, endReason: string) {
     if (!currentCycle) return;
     
-    // Close any open In Testing period
-    const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
-    if (lastPeriod && lastPeriod.end === null) {
-      lastPeriod.end = endTime;
-      lastPeriod.hours = (endTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
-    }
-    
-    // Calculate total hours for this cycle (sum of all merged periods)
+    // Calculate total hours for this cycle (sum of all periods)
     const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
     
     // Update tester metrics
@@ -488,10 +461,8 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
     const data = testerMetrics.get(currentCycle.tester)!;
     data.totalHours += cycleTotalHours;
     data.cycles++;
-    if (iterationCounted) {
-      data.iterations++;
-      totalIterations++;
-    }
+    data.iterations++; // 1 cycle = 1 iteration
+    totalIterations++;
     totalTestingHours += cycleTotalHours;
     
     cycleIndex++;
@@ -507,11 +478,11 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
       totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
       mergedPeriods: currentCycle.periods.map(p => ({
         start: p.start.toISOString(),
-        end: p.end?.toISOString() || endTime.toISOString(),
+        end: p.end.toISOString(),
         hours: Math.round(p.hours * 100) / 100,
       })),
-      iterationCounted,
-      iterationReason,
+      iterationCounted: true,
+      iterationReason: 'One completed cycle = one iteration',
     });
     
     console.log('[DEV_CYCLE_CLOSED]', JSON.stringify({
@@ -521,17 +492,15 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
       endReason,
       totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
       periodsCount: currentCycle.periods.length,
-      iterationCounted,
-      iterationReason,
     }));
     
     currentCycle = null;
   }
   
-  for (let i = 0; i < transitionsWithLookahead.length; i++) {
-    const t = transitionsWithLookahead[i];
+  for (let i = 0; i < transitions.length; i++) {
+    const t = transitions[i];
     
-    // Transition INTO DEV_In Testing
+    // Transition INTO DEV_In Testing from ANY state
     if (t.toState === STATES.DEV_IN_TESTING) {
       const currentTester = t.changedBy || t.assignedTo || 'Unknown';
       
@@ -542,40 +511,48 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
         tester: currentTester,
         timestamp: t.timestamp.toISOString(),
         hasCycle: !!currentCycle,
-        cycleInAcceptance: currentCycle?.inAcceptance,
+        pendingMerge: currentCycle?.pendingMerge,
         cycleTester: currentCycle?.tester,
       }));
       
-      if (currentCycle && currentCycle.inAcceptance && currentCycle.tester === currentTester) {
-        // SAME tester returning from Acceptance - MERGE into existing cycle
+      // Check if we can merge (coming from Acceptance, same tester)
+      if (currentCycle && currentCycle.pendingMerge && 
+          t.fromState === STATES.DEV_ACCEPTANCE_TESTING &&
+          currentCycle.tester === currentTester) {
+        // MERGE: Add a new period to the existing cycle
         currentCycle.periods.push({
           start: t.timestamp,
-          end: null,
+          end: t.timestamp, // Will be updated when we leave In Testing
           hours: 0,
         });
-        currentCycle.inAcceptance = false;
+        currentCycle.pendingMerge = false;
+        currentCycle.pendingMergeEnd = null;
+        currentCycle.inTestingStart = t.timestamp;
         
         console.log('[DEV_CYCLE_MERGE]', JSON.stringify({
           workItemId,
           tester: currentTester,
-          reason: 'Same tester returning from Acceptance',
+          reason: 'Same tester returning from Acceptance, merging periods',
           periodsCount: currentCycle.periods.length,
         }));
       } else {
-        // DIFFERENT tester or no existing cycle - close previous and start new
+        // Close any existing cycle first (different tester or not from Acceptance)
         if (currentCycle) {
-          const endReason = currentCycle.inAcceptance 
-            ? 'Tester Changed (different tester took over from Acceptance)' 
-            : 'New cycle started by different tester';
-          closeCycle(t.timestamp, endReason, true, 'Cycle closed before new tester, iteration counted');
+          const closeTime = currentCycle.pendingMergeEnd || t.timestamp;
+          const closeReason = currentCycle.pendingMerge 
+            ? `Different tester took over (was: ${currentCycle.tester}, now: ${currentTester})`
+            : 'New cycle started';
+          closeCycle(closeTime, closeReason);
         }
         
         // Start new cycle
         currentCycle = {
           tester: currentTester,
           cycleStart: t.timestamp,
-          periods: [{ start: t.timestamp, end: null, hours: 0 }],
-          inAcceptance: false,
+          inTestingStart: t.timestamp,
+          periods: [{ start: t.timestamp, end: t.timestamp, hours: 0 }],
+          pendingMerge: false,
+          pendingMergeEnd: null,
         };
         
         console.log('[DEV_CYCLE_START]', JSON.stringify({
@@ -586,63 +563,136 @@ function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: 
         }));
       }
     }
-    // Transition FROM DEV_In Testing TO DEV_Acceptance Testing
-    else if (t.fromState === STATES.DEV_IN_TESTING && t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
-      if (currentCycle) {
-        // Close the current In Testing period but potentially keep cycle open
-        const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
-        if (lastPeriod && lastPeriod.end === null) {
-          lastPeriod.end = t.timestamp;
-          lastPeriod.hours = (t.timestamp.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
-        }
-        currentCycle.inAcceptance = true;
+    // Transition FROM DEV_In Testing to ANY other state
+    else if (t.fromState === STATES.DEV_IN_TESTING && currentCycle) {
+      // Calculate hours for current In Testing period
+      const hours = (t.timestamp.getTime() - currentCycle.inTestingStart.getTime()) / (1000 * 60 * 60);
+      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
+      lastPeriod.end = t.timestamp;
+      lastPeriod.hours = hours;
+      
+      console.log('[DEV_FROM_IN_TESTING]', JSON.stringify({
+        workItemId,
+        toState: t.toState,
+        periodHours: Math.round(hours * 100) / 100,
+        tester: currentCycle.tester,
+      }));
+      
+      // Special case: In Testing → Acceptance Testing (potential merge)
+      if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
+        // Check if next transition is back to In Testing by same tester
+        let canMerge = false;
+        let nextInTestingTester: string | null = null;
         
-        // Check if next In Testing is by different tester - if so, close cycle now
-        if (t.nextInTestingTester && t.nextInTestingTester !== currentCycle.tester) {
-          closeCycle(t.timestamp, 'Tester Changed (handed off to different tester)', true, 'Cycle closed before handoff, iteration counted');
+        for (let j = i + 1; j < transitions.length; j++) {
+          const nextT = transitions[j];
+          if (nextT.toState === STATES.DEV_IN_TESTING) {
+            nextInTestingTester = nextT.changedBy || nextT.assignedTo || 'Unknown';
+            if (nextT.fromState === STATES.DEV_ACCEPTANCE_TESTING && nextInTestingTester === currentCycle.tester) {
+              canMerge = true;
+            }
+            break;
+          }
+          // If any other state appears before next In Testing, cannot merge
+          if (nextT.toState !== STATES.DEV_ACCEPTANCE_TESTING && nextT.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
+            break;
+          }
         }
         
-        console.log('[DEV_TO_ACCEPTANCE]', JSON.stringify({
-          workItemId,
-          tester: currentCycle?.tester,
-          periodHours: lastPeriod?.hours ? Math.round(lastPeriod.hours * 100) / 100 : 0,
-          nextTester: t.nextInTestingTester || 'unknown',
-          willClose: t.nextInTestingTester && t.nextInTestingTester !== currentCycle?.tester,
-        }));
+        if (canMerge) {
+          // Keep cycle open, mark as pending merge
+          currentCycle.pendingMerge = true;
+          currentCycle.pendingMergeEnd = t.timestamp;
+          
+          console.log('[DEV_PENDING_MERGE]', JSON.stringify({
+            workItemId,
+            tester: currentCycle.tester,
+            reason: 'Moved to Acceptance, next In Testing is by same tester',
+          }));
+        } else {
+          // Close the cycle
+          const closeReason = nextInTestingTester && nextInTestingTester !== currentCycle.tester
+            ? `Acceptance Testing → different tester will take over (${nextInTestingTester})`
+            : 'Acceptance Testing → no merge possible';
+          closeCycle(t.timestamp, closeReason);
+        }
+      } else {
+        // Any other transition from In Testing closes the cycle
+        closeCycle(t.timestamp, `Transition to ${t.toState}`);
       }
     }
-    // Cycle-closing transitions FROM DEV_In Testing
-    else if (currentCycle && t.fromState === STATES.DEV_IN_TESTING && DEV_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
-      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle completed with ${t.toState}, iteration counted`);
-    }
-    // Cycle-closing transitions FROM DEV_Acceptance Testing
-    else if (currentCycle && currentCycle.inAcceptance && 
-             t.fromState === STATES.DEV_ACCEPTANCE_TESTING &&
-             DEV_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
-      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle closed from Acceptance with ${t.toState}, iteration counted`);
+    // Handle case where we're in pending merge state and something else happens from Acceptance
+    else if (currentCycle && currentCycle.pendingMerge && t.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
+      // If toState is not In Testing, close the cycle
+      if (t.toState !== STATES.DEV_IN_TESTING) {
+        closeCycle(t.timestamp, `From Acceptance to ${t.toState} (merge cancelled)`);
+      }
     }
   }
   
-  // Close any remaining open cycle at the end (not completed = no iteration)
+  // Close any remaining open cycle (incomplete)
   if (currentCycle) {
     const lastTransition = transitions[transitions.length - 1];
-    closeCycle(lastTransition?.timestamp || new Date(), 'End of transitions (cycle incomplete)', false, 'Cycle not completed, no closing transition');
+    // For incomplete cycles, still count as iteration but note it
+    const closeTime = currentCycle.pendingMergeEnd || lastTransition?.timestamp || new Date();
+    
+    // Calculate remaining hours if still in testing
+    if (currentCycle.periods.length > 0) {
+      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
+      if (lastPeriod.hours === 0 && lastPeriod.end.getTime() === lastPeriod.start.getTime()) {
+        // Period was never closed, use last transition time
+        lastPeriod.end = closeTime;
+        lastPeriod.hours = (closeTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
+      }
+    }
+    
+    // Don't count incomplete cycles as iterations
+    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
+    
+    if (!testerMetrics.has(currentCycle.tester)) {
+      testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
+    }
+    const data = testerMetrics.get(currentCycle.tester)!;
+    data.totalHours += cycleTotalHours;
+    data.cycles++;
+    // Don't increment iterations for incomplete cycles
+    totalTestingHours += cycleTotalHours;
+    
+    cycleIndex++;
+    
+    debugCycles.push({
+      cycleIndex,
+      env: 'DEV',
+      tester: currentCycle.tester,
+      cycleStart: currentCycle.cycleStart.toISOString(),
+      cycleEnd: closeTime.toISOString(),
+      endReason: 'End of transitions (cycle incomplete)',
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+      mergedPeriods: currentCycle.periods.map(p => ({
+        start: p.start.toISOString(),
+        end: p.end.toISOString(),
+        hours: Math.round(p.hours * 100) / 100,
+      })),
+      iterationCounted: false,
+      iterationReason: 'Cycle not completed - no closing transition',
+    });
+    
+    console.log('[DEV_CYCLE_INCOMPLETE]', JSON.stringify({
+      workItemId,
+      cycleIndex,
+      tester: currentCycle.tester,
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+    }));
+    
+    currentCycle = null;
   }
   
   return { metrics: testerMetrics, debugCycles, totalIterations, totalTestingHours };
 }
 
 /**
- * Calculate STG testing metrics with proper cycle closing logic
- * 
- * CYCLE CLOSING RULES for STG:
- * - STG_In Testing → Fix Required
- * - STG_In Testing → Ready for Release
- * - STG_In Testing → STG_Acceptance Testing (only if next In Testing is by different tester)
- * - STG_Acceptance Testing → Fix Required
- * - STG_Acceptance Testing → Ready for Release
- * 
- * Note: STG does NOT close on Approved (only DEV does)
+ * Calculate STG testing metrics with corrected cycle logic
+ * Same logic as DEV but for STG states
  */
 function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
   metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
@@ -653,49 +703,21 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
   const debugCycles: TestingCycleDebug[] = [];
   
-  // States that close a STG testing cycle (no Approved for STG)
-  const STG_CYCLE_CLOSING_STATES = [
-    STATES.FIX_REQUIRED,
-    STATES.READY_FOR_RELEASE,
-  ];
-  
   let currentCycle: {
     tester: string;
     cycleStart: Date;
-    periods: Array<{ start: Date; end: Date | null; hours: number }>;
-    inAcceptance: boolean;
+    inTestingStart: Date;
+    periods: Array<{ start: Date; end: Date; hours: number }>;
+    pendingMerge: boolean;
+    pendingMergeEnd: Date | null;
   } | null = null;
   
   let totalIterations = 0;
   let totalTestingHours = 0;
   let cycleIndex = 0;
   
-  // Pre-process: Look ahead to determine if next In Testing transition is by same/different tester
-  const transitionsWithLookahead: Array<TransitionEvent & { nextInTestingTester?: string }> = transitions.map((t, i) => {
-    const result = { ...t, nextInTestingTester: undefined as string | undefined };
-    
-    if (t.toState === STATES.STG_ACCEPTANCE_TESTING) {
-      for (let j = i + 1; j < transitions.length; j++) {
-        if (transitions[j].toState === STATES.STG_IN_TESTING) {
-          result.nextInTestingTester = transitions[j].changedBy || transitions[j].assignedTo || 'Unknown';
-          break;
-        }
-        if (STG_CYCLE_CLOSING_STATES.includes(transitions[j].toState as any)) {
-          break;
-        }
-      }
-    }
-    return result;
-  });
-  
-  function closeCycle(endTime: Date, endReason: string, iterationCounted: boolean, iterationReason: string) {
+  function closeCycle(endTime: Date, endReason: string) {
     if (!currentCycle) return;
-    
-    const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
-    if (lastPeriod && lastPeriod.end === null) {
-      lastPeriod.end = endTime;
-      lastPeriod.hours = (endTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
-    }
     
     const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
     
@@ -705,10 +727,8 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
     const data = testerMetrics.get(currentCycle.tester)!;
     data.totalHours += cycleTotalHours;
     data.cycles++;
-    if (iterationCounted) {
-      data.iterations++;
-      totalIterations++;
-    }
+    data.iterations++;
+    totalIterations++;
     totalTestingHours += cycleTotalHours;
     
     cycleIndex++;
@@ -723,11 +743,11 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
       totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
       mergedPeriods: currentCycle.periods.map(p => ({
         start: p.start.toISOString(),
-        end: p.end?.toISOString() || endTime.toISOString(),
+        end: p.end.toISOString(),
         hours: Math.round(p.hours * 100) / 100,
       })),
-      iterationCounted,
-      iterationReason,
+      iterationCounted: true,
+      iterationReason: 'One completed cycle = one iteration',
     });
     
     console.log('[STG_CYCLE_CLOSED]', JSON.stringify({
@@ -737,15 +757,13 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
       endReason,
       totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
       periodsCount: currentCycle.periods.length,
-      iterationCounted,
-      iterationReason,
     }));
     
     currentCycle = null;
   }
   
-  for (let i = 0; i < transitionsWithLookahead.length; i++) {
-    const t = transitionsWithLookahead[i];
+  for (let i = 0; i < transitions.length; i++) {
+    const t = transitions[i];
     
     if (t.toState === STATES.STG_IN_TESTING) {
       const currentTester = t.changedBy || t.assignedTo || 'Unknown';
@@ -757,37 +775,44 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
         tester: currentTester,
         timestamp: t.timestamp.toISOString(),
         hasCycle: !!currentCycle,
-        cycleInAcceptance: currentCycle?.inAcceptance,
+        pendingMerge: currentCycle?.pendingMerge,
         cycleTester: currentCycle?.tester,
       }));
       
-      if (currentCycle && currentCycle.inAcceptance && currentCycle.tester === currentTester) {
+      if (currentCycle && currentCycle.pendingMerge && 
+          t.fromState === STATES.STG_ACCEPTANCE_TESTING &&
+          currentCycle.tester === currentTester) {
         currentCycle.periods.push({
           start: t.timestamp,
-          end: null,
+          end: t.timestamp,
           hours: 0,
         });
-        currentCycle.inAcceptance = false;
+        currentCycle.pendingMerge = false;
+        currentCycle.pendingMergeEnd = null;
+        currentCycle.inTestingStart = t.timestamp;
         
         console.log('[STG_CYCLE_MERGE]', JSON.stringify({
           workItemId,
           tester: currentTester,
-          reason: 'Same tester returning from Acceptance',
+          reason: 'Same tester returning from Acceptance, merging periods',
           periodsCount: currentCycle.periods.length,
         }));
       } else {
         if (currentCycle) {
-          const endReason = currentCycle.inAcceptance 
-            ? 'Tester Changed (different tester took over from Acceptance)' 
-            : 'New cycle started by different tester';
-          closeCycle(t.timestamp, endReason, true, 'Cycle closed before new tester, iteration counted');
+          const closeTime = currentCycle.pendingMergeEnd || t.timestamp;
+          const closeReason = currentCycle.pendingMerge 
+            ? `Different tester took over (was: ${currentCycle.tester}, now: ${currentTester})`
+            : 'New cycle started';
+          closeCycle(closeTime, closeReason);
         }
         
         currentCycle = {
           tester: currentTester,
           cycleStart: t.timestamp,
-          periods: [{ start: t.timestamp, end: null, hours: 0 }],
-          inAcceptance: false,
+          inTestingStart: t.timestamp,
+          periods: [{ start: t.timestamp, end: t.timestamp, hours: 0 }],
+          pendingMerge: false,
+          pendingMergeEnd: null,
         };
         
         console.log('[STG_CYCLE_START]', JSON.stringify({
@@ -798,41 +823,113 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
         }));
       }
     }
-    else if (t.fromState === STATES.STG_IN_TESTING && t.toState === STATES.STG_ACCEPTANCE_TESTING) {
-      if (currentCycle) {
-        const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
-        if (lastPeriod && lastPeriod.end === null) {
-          lastPeriod.end = t.timestamp;
-          lastPeriod.hours = (t.timestamp.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
-        }
-        currentCycle.inAcceptance = true;
+    else if (t.fromState === STATES.STG_IN_TESTING && currentCycle) {
+      const hours = (t.timestamp.getTime() - currentCycle.inTestingStart.getTime()) / (1000 * 60 * 60);
+      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
+      lastPeriod.end = t.timestamp;
+      lastPeriod.hours = hours;
+      
+      console.log('[STG_FROM_IN_TESTING]', JSON.stringify({
+        workItemId,
+        toState: t.toState,
+        periodHours: Math.round(hours * 100) / 100,
+        tester: currentCycle.tester,
+      }));
+      
+      if (t.toState === STATES.STG_ACCEPTANCE_TESTING) {
+        let canMerge = false;
+        let nextInTestingTester: string | null = null;
         
-        if (t.nextInTestingTester && t.nextInTestingTester !== currentCycle.tester) {
-          closeCycle(t.timestamp, 'Tester Changed (handed off to different tester)', true, 'Cycle closed before handoff, iteration counted');
+        for (let j = i + 1; j < transitions.length; j++) {
+          const nextT = transitions[j];
+          if (nextT.toState === STATES.STG_IN_TESTING) {
+            nextInTestingTester = nextT.changedBy || nextT.assignedTo || 'Unknown';
+            if (nextT.fromState === STATES.STG_ACCEPTANCE_TESTING && nextInTestingTester === currentCycle.tester) {
+              canMerge = true;
+            }
+            break;
+          }
+          if (nextT.toState !== STATES.STG_ACCEPTANCE_TESTING && nextT.fromState === STATES.STG_ACCEPTANCE_TESTING) {
+            break;
+          }
         }
         
-        console.log('[STG_TO_ACCEPTANCE]', JSON.stringify({
-          workItemId,
-          tester: currentCycle?.tester,
-          periodHours: lastPeriod?.hours ? Math.round(lastPeriod.hours * 100) / 100 : 0,
-          nextTester: t.nextInTestingTester || 'unknown',
-          willClose: t.nextInTestingTester && t.nextInTestingTester !== currentCycle?.tester,
-        }));
+        if (canMerge) {
+          currentCycle.pendingMerge = true;
+          currentCycle.pendingMergeEnd = t.timestamp;
+          
+          console.log('[STG_PENDING_MERGE]', JSON.stringify({
+            workItemId,
+            tester: currentCycle.tester,
+            reason: 'Moved to Acceptance, next In Testing is by same tester',
+          }));
+        } else {
+          const closeReason = nextInTestingTester && nextInTestingTester !== currentCycle.tester
+            ? `Acceptance Testing → different tester will take over (${nextInTestingTester})`
+            : 'Acceptance Testing → no merge possible';
+          closeCycle(t.timestamp, closeReason);
+        }
+      } else {
+        closeCycle(t.timestamp, `Transition to ${t.toState}`);
       }
     }
-    else if (currentCycle && t.fromState === STATES.STG_IN_TESTING && STG_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
-      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle completed with ${t.toState}, iteration counted`);
-    }
-    else if (currentCycle && currentCycle.inAcceptance && 
-             t.fromState === STATES.STG_ACCEPTANCE_TESTING &&
-             STG_CYCLE_CLOSING_STATES.includes(t.toState as any)) {
-      closeCycle(t.timestamp, `${t.toState}`, true, `Cycle closed from Acceptance with ${t.toState}, iteration counted`);
+    else if (currentCycle && currentCycle.pendingMerge && t.fromState === STATES.STG_ACCEPTANCE_TESTING) {
+      if (t.toState !== STATES.STG_IN_TESTING) {
+        closeCycle(t.timestamp, `From Acceptance to ${t.toState} (merge cancelled)`);
+      }
     }
   }
   
+  // Close any remaining open cycle (incomplete)
   if (currentCycle) {
     const lastTransition = transitions[transitions.length - 1];
-    closeCycle(lastTransition?.timestamp || new Date(), 'End of transitions (cycle incomplete)', false, 'Cycle not completed, no closing transition');
+    const closeTime = currentCycle.pendingMergeEnd || lastTransition?.timestamp || new Date();
+    
+    if (currentCycle.periods.length > 0) {
+      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
+      if (lastPeriod.hours === 0 && lastPeriod.end.getTime() === lastPeriod.start.getTime()) {
+        lastPeriod.end = closeTime;
+        lastPeriod.hours = (closeTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
+      }
+    }
+    
+    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
+    
+    if (!testerMetrics.has(currentCycle.tester)) {
+      testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
+    }
+    const data = testerMetrics.get(currentCycle.tester)!;
+    data.totalHours += cycleTotalHours;
+    data.cycles++;
+    totalTestingHours += cycleTotalHours;
+    
+    cycleIndex++;
+    
+    debugCycles.push({
+      cycleIndex,
+      env: 'STG',
+      tester: currentCycle.tester,
+      cycleStart: currentCycle.cycleStart.toISOString(),
+      cycleEnd: closeTime.toISOString(),
+      endReason: 'End of transitions (cycle incomplete)',
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+      mergedPeriods: currentCycle.periods.map(p => ({
+        start: p.start.toISOString(),
+        end: p.end.toISOString(),
+        hours: Math.round(p.hours * 100) / 100,
+      })),
+      iterationCounted: false,
+      iterationReason: 'Cycle not completed - no closing transition',
+    });
+    
+    console.log('[STG_CYCLE_INCOMPLETE]', JSON.stringify({
+      workItemId,
+      cycleIndex,
+      tester: currentCycle.tester,
+      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
+    }));
+    
+    currentCycle = null;
   }
   
   return { metrics: testerMetrics, debugCycles, totalIterations, totalTestingHours };
@@ -983,20 +1080,23 @@ serve(async (req) => {
       prsReviewed: number;
     }> = new Map();
 
-    const allTesters = new Set<string>();
     const allPrComments: Map<string, number> = new Map();
     const prCountByAuthor: Map<string, number> = new Map();
+    const allTesters = new Set<string>();
 
+    let numTasks = 0;
     let globalDevTotalHours = 0;
     let globalDevTestingTotalHours = 0;
     let globalStgTestingTotalHours = 0;
-    const numTasks = metricsItems.length;
 
     for (const workItem of metricsItems) {
       const revisions = await getWorkItemRevisions(organization, project, workItem.id, pat);
       const transitions = extractTransitions(revisions, workItem.id);
+      
       const workItemType = workItem.fields['System.WorkItemType'] as string;
       const finalState = workItem.fields['System.State'] as string;
+      
+      numTasks++;
       
       const tester1 = getDisplayName(workItem.fields['Custom.TestedBy1']);
       const tester2 = getDisplayName(workItem.fields['Custom.TestedBy2']);
@@ -1135,9 +1235,11 @@ serve(async (req) => {
           activePeriods: devTimeResult.debugPeriods,
           totalActiveHours: Math.round(devTimeResult.totalHours * 100) / 100,
           participatesInDevAvg: devTimeResult.totalHours > 0,
-          reason: devTimeResult.totalHours > 0 
-            ? `Has ${devTimeResult.cycles} development cycle(s)` 
-            : 'No completed Active periods found',
+          reason: devTimeResult.stoppedAtAcceptance 
+            ? `Stopped at first DEV_Acceptance Testing with ${devTimeResult.cycles} cycle(s)` 
+            : devTimeResult.totalHours > 0 
+              ? `Has ${devTimeResult.cycles} development cycle(s)` 
+              : 'No completed Active periods found',
         },
         devTesting: {
           cycles: devTestingResult.debugCycles,
