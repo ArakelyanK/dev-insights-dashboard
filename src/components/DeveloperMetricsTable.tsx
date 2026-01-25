@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import type { DeveloperMetrics } from "@/types/metrics";
 import { formatDuration, formatNumber } from "@/lib/formatters";
+import { t } from "@/lib/i18n";
 import { ArrowUpDown, ArrowUp, ArrowDown, Filter, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -10,9 +11,10 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
-
 interface DeveloperMetricsTableProps {
   metrics: DeveloperMetrics[];
+  organization: string;
+  project: string;
 }
 
 type SortField = 
@@ -30,11 +32,18 @@ type SortField =
 
 type SortDirection = 'asc' | 'desc';
 
-export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
+interface DrillDownState {
+  open: boolean;
+  title: string;
+  items: WorkItemReference[];
+}
+
+export function DeveloperMetricsTable({ metrics, organization, project }: DeveloperMetricsTableProps) {
   const [sortField, setSortField] = useState<SortField>('itemsCompleted');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [selectedDevelopers, setSelectedDevelopers] = useState<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = useState(false);
+  const [drillDown, setDrillDown] = useState<DrillDownState>({ open: false, title: '', items: [] });
 
   const allDevelopers = useMemo(() => 
     metrics.map(m => m.developer).sort((a, b) => a.localeCompare(b)),
@@ -91,6 +100,10 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
     return result;
   }, [metrics, sortField, sortDirection, selectedDevelopers]);
 
+  const openDrillDown = (title: string, items: WorkItemReference[]) => {
+    setDrillDown({ open: true, title, items });
+  };
+
   const SortIcon = ({ field }: { field: SortField }) => {
     if (sortField !== field) return <ArrowUpDown className="h-3 w-3 ml-1 opacity-50" />;
     return sortDirection === 'asc' 
@@ -113,7 +126,7 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
   if (metrics.length === 0) {
     return (
       <div className="text-center py-8 text-muted-foreground">
-        No developer metrics available
+        {t('noDeveloperMetrics')}
       </div>
     );
   }
@@ -126,7 +139,7 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
           <PopoverTrigger asChild>
             <Button variant="outline" size="sm" className="gap-2">
               <Filter className="h-4 w-4" />
-              Filter Developers
+              {t('filterDevelopers')}
               {selectedDevelopers.size > 0 && (
                 <span className="ml-1 px-1.5 py-0.5 text-xs bg-primary text-primary-foreground rounded-full">
                   {selectedDevelopers.size}
@@ -137,10 +150,10 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
           <PopoverContent className="w-64 p-0" align="start">
             <div className="p-3 border-b">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">Select Developers</span>
+                <span className="text-sm font-medium">{t('selectDevelopers')}</span>
                 {selectedDevelopers.size > 0 && (
                   <Button variant="ghost" size="sm" onClick={clearFilters} className="h-6 px-2 text-xs">
-                    Clear all
+                    {t('clearAll')}
                   </Button>
                 )}
               </div>
@@ -167,7 +180,7 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
         {selectedDevelopers.size > 0 && (
           <Button variant="ghost" size="sm" onClick={clearFilters} className="gap-1">
             <X className="h-3 w-3" />
-            Clear filters
+            {t('clearFilters')}
           </Button>
         )}
       </div>
@@ -176,17 +189,17 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
         <table className="data-table">
           <thead>
             <tr>
-              <SortableHeader field="developer">Developer</SortableHeader>
-              <SortableHeader field="avgDevTimeHours">Avg Dev Time (Active)</SortableHeader>
-              <SortableHeader field="itemsCompleted">Items Completed</SortableHeader>
-              <SortableHeader field="totalReturnCount">Total Returns</SortableHeader>
-              <SortableHeader field="avgTotalReturnsPerTask">Avg Returns/Task</SortableHeader>
-              <SortableHeader field="codeReviewReturns">Code Review → Fix</SortableHeader>
-              <SortableHeader field="avgCodeReviewReturnsPerTask">Avg CR Fix/Task</SortableHeader>
-              <SortableHeader field="devTestingReturns">DEV Test → Fix</SortableHeader>
-              <SortableHeader field="avgDevTestingReturnsPerTask">Avg DEV Fix/Task</SortableHeader>
-              <SortableHeader field="stgTestingReturns">STG Test → Fix</SortableHeader>
-              <SortableHeader field="avgStgTestingReturnsPerTask">Avg STG Fix/Task</SortableHeader>
+              <SortableHeader field="developer">{t('developer')}</SortableHeader>
+              <SortableHeader field="avgDevTimeHours">{t('avgDevTimeActive')}</SortableHeader>
+              <SortableHeader field="itemsCompleted">{t('itemsCompleted')}</SortableHeader>
+              <SortableHeader field="totalReturnCount">{t('totalReturnsShort')}</SortableHeader>
+              <SortableHeader field="avgTotalReturnsPerTask">{t('avgReturnsPerTask')}</SortableHeader>
+              <SortableHeader field="codeReviewReturns">{t('codeReviewFix')}</SortableHeader>
+              <SortableHeader field="avgCodeReviewReturnsPerTask">{t('avgCrFixPerTask')}</SortableHeader>
+              <SortableHeader field="devTestingReturns">{t('devTestFix')}</SortableHeader>
+              <SortableHeader field="avgDevTestingReturnsPerTask">{t('avgDevFixPerTask')}</SortableHeader>
+              <SortableHeader field="stgTestingReturns">{t('stgTestFix')}</SortableHeader>
+              <SortableHeader field="avgStgTestingReturnsPerTask">{t('avgStgFixPerTask')}</SortableHeader>
             </tr>
           </thead>
           <tbody>
@@ -203,19 +216,24 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
                 <td>{formatNumber(metric.avgTotalReturnsPerTask, 2)}</td>
                 <td>{metric.codeReviewReturns}</td>
                 <td>{formatNumber(metric.avgCodeReviewReturnsPerTask, 2)}</td>
-                <td>
-                  <span className="badge-dev">{metric.devTestingReturns}</span>
-                </td>
+                <td><span className="badge-dev">{metric.devTestingReturns}</span></td>
                 <td>{formatNumber(metric.avgDevTestingReturnsPerTask, 2)}</td>
-                <td>
-                  <span className="badge-stg">{metric.stgTestingReturns}</span>
-                </td>
+                <td><span className="badge-stg">{metric.stgTestingReturns}</span></td>
                 <td>{formatNumber(metric.avgStgTestingReturnsPerTask, 2)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+
+      <DrillDownModal
+        open={drillDown.open}
+        onOpenChange={(open) => setDrillDown(prev => ({ ...prev, open }))}
+        title={drillDown.title}
+        items={drillDown.items}
+        organization={organization}
+        project={project}
+      />
     </div>
   );
 }

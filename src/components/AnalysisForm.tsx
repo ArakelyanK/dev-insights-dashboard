@@ -1,41 +1,56 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { AlertCircle, BarChart3, Lock, Eye, EyeOff } from "lucide-react";
+import { AlertCircle, BarChart3, Lock, Eye, EyeOff, CheckCircle2 } from "lucide-react";
 import { extractQueryId } from "@/lib/api";
+import { t } from "@/lib/i18n";
 import type { AnalysisRequest } from "@/types/metrics";
 
 interface AnalysisFormProps {
   onSubmit: (request: AnalysisRequest) => void;
   isLoading: boolean;
+  initialValues?: Partial<AnalysisRequest>;
 }
 
-export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
-  const [organization, setOrganization] = useState("");
-  const [project, setProject] = useState("");
+export function AnalysisForm({ onSubmit, isLoading, initialValues }: AnalysisFormProps) {
+  const [organization, setOrganization] = useState(initialValues?.organization || "");
+  const [project, setProject] = useState(initialValues?.project || "");
   const [queryUrl, setQueryUrl] = useState("");
-  const [pat, setPat] = useState("");
+  const [pat, setPat] = useState(initialValues?.pat || "");
   const [showPat, setShowPat] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  
+  // Track if PAT was previously entered
+  const [patSaved, setPatSaved] = useState(!!initialValues?.pat);
+
+  // Update fields when initialValues change (coming back from results)
+  useEffect(() => {
+    if (initialValues?.organization) setOrganization(initialValues.organization);
+    if (initialValues?.project) setProject(initialValues.project);
+    if (initialValues?.pat) {
+      setPat(initialValues.pat);
+      setPatSaved(true);
+    }
+  }, [initialValues]);
 
   const validate = (): boolean => {
     const newErrors: Record<string, string> = {};
 
     if (!organization.trim()) {
-      newErrors.organization = "Organization is required";
+      newErrors.organization = t('organizationRequired');
     }
     if (!project.trim()) {
-      newErrors.project = "Project is required";
+      newErrors.project = t('projectRequired');
     }
     if (!queryUrl.trim()) {
-      newErrors.queryUrl = "Query URL or ID is required";
+      newErrors.queryUrl = t('queryRequired');
     }
     if (!pat.trim()) {
-      newErrors.pat = "Personal Access Token is required";
+      newErrors.pat = t('patRequired');
     } else if (pat.length < 20) {
-      newErrors.pat = "PAT appears to be invalid (too short)";
+      newErrors.pat = t('patInvalid');
     }
 
     setErrors(newErrors);
@@ -48,6 +63,7 @@ export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
     if (!validate()) return;
 
     const queryId = extractQueryId(queryUrl);
+    setPatSaved(true);
 
     onSubmit({
       organization: organization.trim(),
@@ -62,17 +78,17 @@ export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
       <CardHeader className="space-y-1">
         <div className="flex items-center gap-2">
           <BarChart3 className="h-6 w-6 text-primary" />
-          <CardTitle className="text-2xl">Azure DevOps Analytics</CardTitle>
+          <CardTitle className="text-2xl">{t('azureDevOpsAnalytics')}</CardTitle>
         </div>
         <CardDescription>
-          Analyze development and testing performance metrics from your Azure DevOps work items.
+          {t('analyzeDescription')}
         </CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={handleSubmit} className="space-y-6">
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="organization">Organization</Label>
+              <Label htmlFor="organization">{t('organization')}</Label>
               <Input
                 id="organization"
                 placeholder="your-org"
@@ -90,7 +106,7 @@ export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="project">Project</Label>
+              <Label htmlFor="project">{t('project')}</Label>
               <Input
                 id="project"
                 placeholder="MyProject"
@@ -109,10 +125,10 @@ export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="queryUrl">Query URL or Query ID</Label>
+            <Label htmlFor="queryUrl">{t('queryUrlOrId')}</Label>
             <Input
               id="queryUrl"
-              placeholder="https://dev.azure.com/org/project/_queries/query/... or query GUID"
+              placeholder={t('queryPlaceholder')}
               value={queryUrl}
               onChange={(e) => setQueryUrl(e.target.value)}
               disabled={isLoading}
@@ -125,22 +141,31 @@ export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
               </p>
             )}
             <p className="text-xs text-muted-foreground">
-              Enter the full URL of your saved query or just the query ID (GUID)
+              {t('queryHint')}
             </p>
           </div>
 
           <div className="space-y-2">
             <Label htmlFor="pat" className="flex items-center gap-2">
               <Lock className="h-3.5 w-3.5" />
-              Personal Access Token (PAT)
+              {t('pat')}
+              {patSaved && pat && (
+                <span className="flex items-center gap-1 text-xs text-success">
+                  <CheckCircle2 className="h-3 w-3" />
+                  Сохранён для сессии
+                </span>
+              )}
             </Label>
             <div className="relative">
               <Input
                 id="pat"
                 type={showPat ? "text" : "password"}
-                placeholder="Enter your Azure DevOps PAT"
+                placeholder={patSaved && pat ? "••••••••••••••••••••••••" : t('enterPat')}
                 value={pat}
-                onChange={(e) => setPat(e.target.value)}
+                onChange={(e) => {
+                  setPat(e.target.value);
+                  setPatSaved(false);
+                }}
                 disabled={isLoading}
                 className={`pr-10 input-secure ${errors.pat ? "border-destructive" : ""}`}
               />
@@ -161,7 +186,7 @@ export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
             )}
             <p className="text-xs text-muted-foreground flex items-center gap-1">
               <Lock className="h-3 w-3" />
-              Your PAT is used only for this request and is never stored.
+              {t('patSecurityNote')}
             </p>
           </div>
 
@@ -173,12 +198,12 @@ export function AnalysisForm({ onSubmit, isLoading }: AnalysisFormProps) {
           >
             {isLoading ? (
               <>
-                <span className="animate-pulse-soft">Analyzing...</span>
+                <span className="animate-pulse-soft">{t('analyzing')}</span>
               </>
             ) : (
               <>
                 <BarChart3 className="mr-2 h-4 w-4" />
-                Analyze Metrics
+                {t('analyzeMetrics')}
               </>
             )}
           </Button>

@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
-import type { TesterMetrics } from "@/types/metrics";
+import type { TesterMetrics, WorkItemReference, PRReference } from "@/types/metrics";
 import { formatDuration, formatNumber } from "@/lib/formatters";
+import { t } from "@/lib/i18n";
 import { ArrowUpDown, ArrowUp, ArrowDown, Filter, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -10,9 +11,14 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ClickableMetric } from "./ClickableMetric";
+import { DrillDownModal } from "./DrillDownModal";
+import { PRDrillDownModal } from "./PRDrillDownModal";
 
 interface TesterMetricsTableProps {
   metrics: TesterMetrics[];
+  organization: string;
+  project: string;
 }
 
 type SortField = 
@@ -29,11 +35,25 @@ type SortField =
 
 type SortDirection = 'asc' | 'desc';
 
-export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
+interface DrillDownState {
+  open: boolean;
+  title: string;
+  items: WorkItemReference[];
+}
+
+interface PRDrillDownState {
+  open: boolean;
+  title: string;
+  prDetails: PRReference[];
+}
+
+export function TesterMetricsTable({ metrics, organization, project }: TesterMetricsTableProps) {
   const [sortField, setSortField] = useState<SortField>('closedItemsCount');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [selectedTesters, setSelectedTesters] = useState<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = useState(false);
+  const [drillDown, setDrillDown] = useState<DrillDownState>({ open: false, title: '', items: [] });
+  const [prDrillDown, setPrDrillDown] = useState<PRDrillDownState>({ open: false, title: '', prDetails: [] });
 
   const allTesters = useMemo(() => 
     metrics.map(m => m.tester).sort((a, b) => a.localeCompare(b)),
@@ -90,6 +110,14 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
     return result;
   }, [metrics, sortField, sortDirection, selectedTesters]);
 
+  const openDrillDown = (title: string, items: WorkItemReference[]) => {
+    setDrillDown({ open: true, title, items });
+  };
+
+  const openPrDrillDown = (title: string, prDetails: PRReference[]) => {
+    setPrDrillDown({ open: true, title, prDetails });
+  };
+
   const SortIcon = ({ field }: { field: SortField }) => {
     if (sortField !== field) return <ArrowUpDown className="h-3 w-3 ml-1 opacity-50" />;
     return sortDirection === 'asc' 
@@ -112,7 +140,7 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
   if (metrics.length === 0) {
     return (
       <div className="text-center py-8 text-muted-foreground">
-        No tester metrics available
+        {t('noTesterMetrics')}
       </div>
     );
   }
@@ -125,7 +153,7 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
           <PopoverTrigger asChild>
             <Button variant="outline" size="sm" className="gap-2">
               <Filter className="h-4 w-4" />
-              Filter Testers
+              {t('filterTesters')}
               {selectedTesters.size > 0 && (
                 <span className="ml-1 px-1.5 py-0.5 text-xs bg-primary text-primary-foreground rounded-full">
                   {selectedTesters.size}
@@ -136,10 +164,10 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
           <PopoverContent className="w-64 p-0" align="start">
             <div className="p-3 border-b">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">Select Testers</span>
+                <span className="text-sm font-medium">{t('selectTesters')}</span>
                 {selectedTesters.size > 0 && (
                   <Button variant="ghost" size="sm" onClick={clearFilters} className="h-6 px-2 text-xs">
-                    Clear all
+                    {t('clearAll')}
                   </Button>
                 )}
               </div>
@@ -166,7 +194,7 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
         {selectedTesters.size > 0 && (
           <Button variant="ghost" size="sm" onClick={clearFilters} className="gap-1">
             <X className="h-3 w-3" />
-            Clear filters
+            {t('clearFilters')}
           </Button>
         )}
       </div>
@@ -175,16 +203,16 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
         <table className="data-table">
           <thead>
             <tr>
-              <SortableHeader field="tester">Tester</SortableHeader>
-              <SortableHeader field="closedItemsCount">Closed Items</SortableHeader>
-              <SortableHeader field="avgDevTestTimeHours">Avg DEV Test Time</SortableHeader>
-              <SortableHeader field="avgStgTestTimeHours">Avg STG Test Time</SortableHeader>
-              <SortableHeader field="devTestingIterations">DEV Iterations</SortableHeader>
-              <SortableHeader field="avgDevIterationsPerTask">Avg DEV Iter/Task</SortableHeader>
-              <SortableHeader field="stgTestingIterations">STG Iterations</SortableHeader>
-              <SortableHeader field="avgStgIterationsPerTask">Avg STG Iter/Task</SortableHeader>
-              <SortableHeader field="prCommentsCount">PR Comments</SortableHeader>
-              <SortableHeader field="avgPrCommentsPerPr">Avg Comments/PR</SortableHeader>
+              <SortableHeader field="tester">{t('tester')}</SortableHeader>
+              <SortableHeader field="closedItemsCount">{t('closedItems')}</SortableHeader>
+              <SortableHeader field="avgDevTestTimeHours">{t('avgDevTestTimeShort')}</SortableHeader>
+              <SortableHeader field="avgStgTestTimeHours">{t('avgStgTestTimeShort')}</SortableHeader>
+              <SortableHeader field="devTestingIterations">{t('devIterations')}</SortableHeader>
+              <SortableHeader field="avgDevIterationsPerTask">{t('avgDevIterPerTask')}</SortableHeader>
+              <SortableHeader field="stgTestingIterations">{t('stgIterations')}</SortableHeader>
+              <SortableHeader field="avgStgIterationsPerTask">{t('avgStgIterPerTask')}</SortableHeader>
+              <SortableHeader field="prCommentsCount">{t('prCommentsShort')}</SortableHeader>
+              <SortableHeader field="avgPrCommentsPerPr">{t('avgCommentsPerPr')}</SortableHeader>
             </tr>
           </thead>
           <tbody>
@@ -192,25 +220,69 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
               <tr key={metric.tester} style={{ animationDelay: `${index * 50}ms` }}>
                 <td className="font-medium">{metric.tester}</td>
                 <td>
-                  <span className="badge-success">{metric.closedItemsCount}</span>
+                  <ClickableMetric
+                    value={<span className="badge-success">{metric.closedItemsCount}</span>}
+                    onClick={metric.closedItems?.length > 0 ? () => openDrillDown(
+                      `${metric.tester}: ${t('closedItems')}`,
+                      metric.closedItems
+                    ) : undefined}
+                  />
                 </td>
                 <td>{formatDuration(metric.avgDevTestTimeHours)}</td>
                 <td>{formatDuration(metric.avgStgTestTimeHours)}</td>
                 <td>
-                  <span className="badge-dev">{metric.devTestingIterations}</span>
+                  <ClickableMetric
+                    value={<span className="badge-dev">{metric.devTestingIterations}</span>}
+                    onClick={metric.devIterationItems?.length > 0 ? () => openDrillDown(
+                      `${metric.tester}: ${t('devIterations')}`,
+                      metric.devIterationItems
+                    ) : undefined}
+                  />
                 </td>
                 <td>{formatNumber(metric.avgDevIterationsPerTask, 2)}</td>
                 <td>
-                  <span className="badge-stg">{metric.stgTestingIterations}</span>
+                  <ClickableMetric
+                    value={<span className="badge-stg">{metric.stgTestingIterations}</span>}
+                    onClick={metric.stgIterationItems?.length > 0 ? () => openDrillDown(
+                      `${metric.tester}: ${t('stgIterations')}`,
+                      metric.stgIterationItems
+                    ) : undefined}
+                  />
                 </td>
                 <td>{formatNumber(metric.avgStgIterationsPerTask, 2)}</td>
-                <td>{metric.prCommentsCount}</td>
+                <td>
+                  <ClickableMetric
+                    value={metric.prCommentsCount}
+                    onClick={metric.prCommentDetails?.length > 0 ? () => openPrDrillDown(
+                      `${metric.tester}: ${t('prCommentsShort')}`,
+                      metric.prCommentDetails
+                    ) : undefined}
+                  />
+                </td>
                 <td>{formatNumber(metric.avgPrCommentsPerPr, 2)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+
+      <DrillDownModal
+        open={drillDown.open}
+        onOpenChange={(open) => setDrillDown(prev => ({ ...prev, open }))}
+        title={drillDown.title}
+        items={drillDown.items}
+        organization={organization}
+        project={project}
+      />
+
+      <PRDrillDownModal
+        open={prDrillDown.open}
+        onOpenChange={(open) => setPrDrillDown(prev => ({ ...prev, open }))}
+        title={prDrillDown.title}
+        prDetails={prDrillDown.prDetails}
+        organization={organization}
+        project={project}
+      />
     </div>
   );
 }
