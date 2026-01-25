@@ -14,13 +14,95 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      analysis_chunks: {
+        Row: {
+          chunk_index: number
+          chunk_type: string
+          created_at: string
+          data: Json
+          id: string
+          job_id: string
+        }
+        Insert: {
+          chunk_index: number
+          chunk_type: string
+          created_at?: string
+          data: Json
+          id?: string
+          job_id: string
+        }
+        Update: {
+          chunk_index?: number
+          chunk_type?: string
+          created_at?: string
+          data?: Json
+          id?: string
+          job_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "analysis_chunks_job_id_fkey"
+            columns: ["job_id"]
+            isOneToOne: false
+            referencedRelation: "analysis_jobs"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      analysis_jobs: {
+        Row: {
+          created_at: string
+          current_step: string | null
+          error_message: string | null
+          expires_at: string
+          id: string
+          organization: string
+          processed_items: number | null
+          project: string
+          query_id: string
+          result: Json | null
+          status: string
+          total_items: number | null
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          current_step?: string | null
+          error_message?: string | null
+          expires_at?: string
+          id?: string
+          organization: string
+          processed_items?: number | null
+          project: string
+          query_id: string
+          result?: Json | null
+          status?: string
+          total_items?: number | null
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          current_step?: string | null
+          error_message?: string | null
+          expires_at?: string
+          id?: string
+          organization?: string
+          processed_items?: number | null
+          project?: string
+          query_id?: string
+          result?: Json | null
+          status?: string
+          total_items?: number | null
+          updated_at?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      cleanup_expired_analysis_jobs: { Args: never; Returns: number }
     }
     Enums: {
       [_ in never]: never
