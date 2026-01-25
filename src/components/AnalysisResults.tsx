@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { MetricCard } from "./MetricCard";
 import { DeveloperMetricsTable } from "./DeveloperMetricsTable";
 import { TesterMetricsTable } from "./TesterMetricsTable";
@@ -19,7 +20,8 @@ import {
   Table,
   Bug,
   FileText,
-  ListTodo
+  ListTodo,
+  AlertTriangle
 } from "lucide-react";
 import { formatDuration } from "@/lib/formatters";
 
@@ -35,6 +37,23 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
 
   return (
     <div className="space-y-8 animate-fade-in">
+      {/* Limitation Warnings */}
+      {(summary.wasLimited || summary.prCommentsSkipped) && (
+        <Alert variant="destructive" className="border-warning bg-warning/10">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>{t('resultsLimited')}</AlertTitle>
+          <AlertDescription className="space-y-1">
+            {summary.wasLimited && (
+              <p>{t('resultsLimitedDesc', { original: summary.originalCount || 0, limited: summary.totalWorkItems })}</p>
+            )}
+            {summary.prCommentsSkipped && (
+              <p>{t('prCommentsSkippedDesc')}</p>
+            )}
+            <p className="text-sm opacity-80">{t('useNarrowerQuery')}</p>
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>

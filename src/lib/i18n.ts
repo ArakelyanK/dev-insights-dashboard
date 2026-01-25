@@ -156,6 +156,13 @@ export const labels = {
   analysisSuccessful: 'Успешно проанализировано {count} рабочих элементов.',
   analysisFailed: 'Ошибка анализа',
   analysisError: 'Ошибка анализа',
+  
+  // Limitation warnings
+  resultsLimited: 'Результаты ограничены',
+  resultsLimitedDesc: 'Запрос вернул {original} элементов. Показаны первые {limited} для предотвращения таймаута.',
+  prCommentsSkipped: 'Комментарии PR пропущены',
+  prCommentsSkippedDesc: 'Для больших запросов анализ PR комментариев пропущен для экономии времени.',
+  useNarrowerQuery: 'Используйте более узкий запрос для полных результатов.',
 } as const;
 
 export type LabelKey = keyof typeof labels;

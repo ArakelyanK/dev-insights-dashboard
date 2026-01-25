@@ -98,6 +98,7 @@ interface WorkItemDebugLog {
 // Debug logging is conditionally enabled based on query size
 let DEBUG_ENABLED = true;
 const MAX_DEBUG_ITEMS = 50;
+const MAX_WORK_ITEMS = 200; // Hard limit to prevent CPU timeout
 
 function emitWorkItemDebugLog(log: WorkItemDebugLog) {
   if (DEBUG_ENABLED) {
@@ -1060,7 +1061,14 @@ serve(async (req) => {
       );
     }
 
-    const workItems = await getWorkItems(organization, project, workItemIds, pat);
+    // Limit work items to prevent CPU timeout
+    const limitedWorkItemIds = workItemIds.slice(0, MAX_WORK_ITEMS);
+    const wasLimited = workItemIds.length > MAX_WORK_ITEMS;
+    if (wasLimited) {
+      console.log(`WARNING: Query returned ${workItemIds.length} items, limiting to ${MAX_WORK_ITEMS} most recent`);
+    }
+
+    const workItems = await getWorkItems(organization, project, limitedWorkItemIds, pat);
     console.log(`Fetched ${workItems.length} work items with details`);
 
     const requirements = workItems.filter(wi => wi.fields['System.WorkItemType'] === 'Requirement');
@@ -1297,34 +1305,39 @@ serve(async (req) => {
       }
     }
 
-    // Process PR comments in batches to avoid timeout
-    const PR_BATCH_SIZE = 10;
-    for (let i = 0; i < prItems.length; i += PR_BATCH_SIZE) {
-      const batch = prItems.slice(i, i + PR_BATCH_SIZE);
-      
-      // Process batch in parallel
-      const batchResults = await Promise.all(
-        batch.map(workItem => getPRComments(organization, project, workItem, pat))
-      );
-      
-      for (let j = 0; j < batch.length; j++) {
-        const workItem = batch[j];
-        const { commentsByAuthor, prCount, debugComments } = batchResults[j];
+    // Process PR comments in batches - skip for large queries to save CPU
+    const skipPrComments = metricsItems.length > 100;
+    if (skipPrComments) {
+      console.log(`Skipping PR comments processing for ${metricsItems.length} items to save CPU time`);
+    } else {
+      const PR_BATCH_SIZE = 10;
+      for (let i = 0; i < prItems.length; i += PR_BATCH_SIZE) {
+        const batch = prItems.slice(i, i + PR_BATCH_SIZE);
         
-        if (DEBUG_ENABLED && debugComments.length > 0) {
-          console.log('[PR_COMMENTS_DEBUG]', JSON.stringify({
-            workItemId: workItem.id,
-            prCount,
-            comments: debugComments,
-          }, null, 2));
-        }
+        // Process batch in parallel
+        const batchResults = await Promise.all(
+          batch.map(workItem => getPRComments(organization, project, workItem, pat))
+        );
         
-        for (const [author, count] of commentsByAuthor) {
-          allPrComments.set(author, (allPrComments.get(author) || 0) + count);
-          prCountByAuthor.set(author, (prCountByAuthor.get(author) || 0) + prCount);
+        for (let j = 0; j < batch.length; j++) {
+          const workItem = batch[j];
+          const { commentsByAuthor, prCount, debugComments } = batchResults[j];
           
-          if (testerData.has(author)) {
-            testerData.get(author)!.prsReviewed += prCount;
+          if (DEBUG_ENABLED && debugComments.length > 0) {
+            console.log('[PR_COMMENTS_DEBUG]', JSON.stringify({
+              workItemId: workItem.id,
+              prCount,
+              comments: debugComments,
+            }, null, 2));
+          }
+          
+          for (const [author, count] of commentsByAuthor) {
+            allPrComments.set(author, (allPrComments.get(author) || 0) + count);
+            prCountByAuthor.set(author, (prCountByAuthor.get(author) || 0) + prCount);
+            
+            if (testerData.has(author)) {
+              testerData.get(author)!.prsReviewed += prCount;
+            }
           }
         }
       }
@@ -1409,6 +1422,9 @@ serve(async (req) => {
       avgStgTestTimeHours: numTasks > 0 ? globalStgTestingTotalHours / numTasks : 0,
       totalReturns,
       totalPrComments,
+      wasLimited,
+      originalCount: workItemIds.length,
+      prCommentsSkipped: skipPrComments,
     };
 
     const chartData = {
