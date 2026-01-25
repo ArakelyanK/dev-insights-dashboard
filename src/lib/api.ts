@@ -66,10 +66,6 @@ async function pollJobStatus(
   const startTime = Date.now();
 
   while (Date.now() - startTime < MAX_POLL_TIME) {
-    const { data, error } = await supabase.functions.invoke('job-status', {
-      body: null,
-      headers: {},
-    });
 
     // Use fetch directly for GET request with query params
     const response = await fetch(
