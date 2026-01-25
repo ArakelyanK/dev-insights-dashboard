@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import type { DeveloperMetrics } from "@/types/metrics";
+import type { DeveloperMetrics, WorkItemReference } from "@/types/metrics";
 import { formatDuration, formatNumber } from "@/lib/formatters";
 import { t } from "@/lib/i18n";
 import { ArrowUpDown, ArrowUp, ArrowDown, Filter, X } from "lucide-react";
@@ -11,6 +11,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { DrillDownModal } from "./DrillDownModal";
 
 interface DeveloperMetricsTableProps {
   metrics: DeveloperMetrics[];
@@ -33,11 +34,16 @@ type SortField =
 
 type SortDirection = 'asc' | 'desc';
 
-export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
+export function DeveloperMetricsTable({ metrics, organization, project }: DeveloperMetricsTableProps) {
   const [sortField, setSortField] = useState<SortField>('itemsCompleted');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [selectedDevelopers, setSelectedDevelopers] = useState<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = useState(false);
+  
+  // Drill-down modal state
+  const [drillDownOpen, setDrillDownOpen] = useState(false);
+  const [drillDownTitle, setDrillDownTitle] = useState("");
+  const [drillDownItems, setDrillDownItems] = useState<WorkItemReference[]>([]);
 
   const allDevelopers = useMemo(() => 
     metrics.map(m => m.developer).sort((a, b) => a.localeCompare(b)),
@@ -67,6 +73,12 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
 
   const clearFilters = () => {
     setSelectedDevelopers(new Set());
+  };
+
+  const openDrillDown = (title: string, items: WorkItemReference[]) => {
+    setDrillDownTitle(title);
+    setDrillDownItems(items);
+    setDrillDownOpen(true);
   };
 
   const filteredAndSortedMetrics = useMemo(() => {
@@ -110,6 +122,32 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
       </div>
     </th>
   );
+
+  // Clickable metric cell
+  const ClickableCell = ({ 
+    value, 
+    items, 
+    title, 
+    className = "" 
+  }: { 
+    value: number; 
+    items: WorkItemReference[]; 
+    title: string;
+    className?: string;
+  }) => {
+    if (items.length === 0) {
+      return <span className={className}>{value}</span>;
+    }
+    return (
+      <button
+        onClick={() => openDrillDown(title, items)}
+        className={`cursor-pointer hover:underline hover:text-primary transition-colors ${className}`}
+        title={t('clickToViewDetails')}
+      >
+        {value}
+      </button>
+    );
+  };
 
   if (metrics.length === 0) {
     return (
@@ -195,24 +233,62 @@ export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
               <tr key={metric.developer} style={{ animationDelay: `${index * 50}ms` }}>
                 <td className="font-medium">{metric.developer}</td>
                 <td>{formatDuration(metric.avgDevTimeHours)}</td>
-                <td>{metric.itemsCompleted}</td>
                 <td>
-                  <span className={metric.totalReturnCount > 0 ? "text-warning font-medium" : ""}>
-                    {metric.totalReturnCount}
-                  </span>
+                  <ClickableCell
+                    value={metric.itemsCompleted}
+                    items={metric.workItems}
+                    title={`${metric.developer} - ${t('itemsCompleted')}`}
+                  />
+                </td>
+                <td>
+                  <ClickableCell
+                    value={metric.totalReturnCount}
+                    items={metric.returnItems}
+                    title={`${metric.developer} - ${t('totalReturnsShort')}`}
+                    className={metric.totalReturnCount > 0 ? "text-warning font-medium" : ""}
+                  />
                 </td>
                 <td>{formatNumber(metric.avgTotalReturnsPerTask, 2)}</td>
-                <td>{metric.codeReviewReturns}</td>
+                <td>
+                  <ClickableCell
+                    value={metric.codeReviewReturns}
+                    items={metric.codeReviewReturnItems}
+                    title={`${metric.developer} - ${t('codeReviewFix')}`}
+                  />
+                </td>
                 <td>{formatNumber(metric.avgCodeReviewReturnsPerTask, 2)}</td>
-                <td><span className="badge-dev">{metric.devTestingReturns}</span></td>
+                <td>
+                  <ClickableCell
+                    value={metric.devTestingReturns}
+                    items={metric.devTestingReturnItems}
+                    title={`${metric.developer} - ${t('devTestFix')}`}
+                    className="badge-dev"
+                  />
+                </td>
                 <td>{formatNumber(metric.avgDevTestingReturnsPerTask, 2)}</td>
-                <td><span className="badge-stg">{metric.stgTestingReturns}</span></td>
+                <td>
+                  <ClickableCell
+                    value={metric.stgTestingReturns}
+                    items={metric.stgTestingReturnItems}
+                    title={`${metric.developer} - ${t('stgTestFix')}`}
+                    className="badge-stg"
+                  />
+                </td>
                 <td>{formatNumber(metric.avgStgTestingReturnsPerTask, 2)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+
+      <DrillDownModal
+        open={drillDownOpen}
+        onOpenChange={setDrillDownOpen}
+        title={drillDownTitle}
+        items={drillDownItems}
+        organization={organization}
+        project={project}
+      />
     </div>
   );
 }

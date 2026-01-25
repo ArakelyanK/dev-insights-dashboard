@@ -103,10 +103,6 @@ export interface AnalysisResult {
     avgStgTestTimeHours: number;
     totalReturns: number;
     totalPrComments: number;
-    // Limitation flags
-    wasLimited?: boolean;
-    originalCount?: number;
-    prCommentsSkipped?: boolean;
   };
   chartData: {
     developmentSpeed: ChartDataPoint[];
