@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import type { TesterMetrics } from "@/types/metrics";
+import type { TesterMetrics, WorkItemReference, PRReference } from "@/types/metrics";
 import { formatDuration, formatNumber } from "@/lib/formatters";
 import { t } from "@/lib/i18n";
 import { ArrowUpDown, ArrowUp, ArrowDown, Filter, X } from "lucide-react";
@@ -11,6 +11,8 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { DrillDownModal } from "./DrillDownModal";
+import { PRDrillDownModal } from "./PRDrillDownModal";
 
 interface TesterMetricsTableProps {
   metrics: TesterMetrics[];
@@ -32,11 +34,21 @@ type SortField =
 
 type SortDirection = 'asc' | 'desc';
 
-export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
+export function TesterMetricsTable({ metrics, organization, project }: TesterMetricsTableProps) {
   const [sortField, setSortField] = useState<SortField>('closedItemsCount');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [selectedTesters, setSelectedTesters] = useState<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = useState(false);
+  
+  // Work item drill-down modal state
+  const [drillDownOpen, setDrillDownOpen] = useState(false);
+  const [drillDownTitle, setDrillDownTitle] = useState("");
+  const [drillDownItems, setDrillDownItems] = useState<WorkItemReference[]>([]);
+  
+  // PR drill-down modal state
+  const [prDrillDownOpen, setPrDrillDownOpen] = useState(false);
+  const [prDrillDownTitle, setPrDrillDownTitle] = useState("");
+  const [prDrillDownItems, setPrDrillDownItems] = useState<PRReference[]>([]);
 
   const allTesters = useMemo(() => 
     metrics.map(m => m.tester).sort((a, b) => a.localeCompare(b)),
@@ -66,6 +78,18 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
 
   const clearFilters = () => {
     setSelectedTesters(new Set());
+  };
+
+  const openDrillDown = (title: string, items: WorkItemReference[]) => {
+    setDrillDownTitle(title);
+    setDrillDownItems(items);
+    setDrillDownOpen(true);
+  };
+
+  const openPrDrillDown = (title: string, items: PRReference[]) => {
+    setPrDrillDownTitle(title);
+    setPrDrillDownItems(items);
+    setPrDrillDownOpen(true);
   };
 
   const filteredAndSortedMetrics = useMemo(() => {
@@ -109,6 +133,58 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
       </div>
     </th>
   );
+
+  // Clickable metric cell for work items
+  const ClickableCell = ({ 
+    value, 
+    items, 
+    title, 
+    className = "" 
+  }: { 
+    value: number; 
+    items: WorkItemReference[]; 
+    title: string;
+    className?: string;
+  }) => {
+    if (items.length === 0) {
+      return <span className={className}>{value}</span>;
+    }
+    return (
+      <button
+        onClick={() => openDrillDown(title, items)}
+        className={`cursor-pointer hover:underline hover:text-primary transition-colors ${className}`}
+        title={t('clickToViewDetails')}
+      >
+        {value}
+      </button>
+    );
+  };
+
+  // Clickable metric cell for PR comments
+  const ClickablePrCell = ({ 
+    value, 
+    items, 
+    title, 
+    className = "" 
+  }: { 
+    value: number; 
+    items: PRReference[]; 
+    title: string;
+    className?: string;
+  }) => {
+    if (items.length === 0) {
+      return <span className={className}>{value}</span>;
+    }
+    return (
+      <button
+        onClick={() => openPrDrillDown(title, items)}
+        className={`cursor-pointer hover:underline hover:text-primary transition-colors ${className}`}
+        title={t('clickToViewDetails')}
+      >
+        {value}
+      </button>
+    );
+  };
 
   if (metrics.length === 0) {
     return (
@@ -192,20 +268,65 @@ export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
             {filteredAndSortedMetrics.map((metric, index) => (
               <tr key={metric.tester} style={{ animationDelay: `${index * 50}ms` }}>
                 <td className="font-medium">{metric.tester}</td>
-                <td><span className="badge-success">{metric.closedItemsCount}</span></td>
+                <td>
+                  <ClickableCell
+                    value={metric.closedItemsCount}
+                    items={metric.closedItems}
+                    title={`${metric.tester} - ${t('closedItems')}`}
+                    className="badge-success"
+                  />
+                </td>
                 <td>{formatDuration(metric.avgDevTestTimeHours)}</td>
                 <td>{formatDuration(metric.avgStgTestTimeHours)}</td>
-                <td><span className="badge-dev">{metric.devTestingIterations}</span></td>
+                <td>
+                  <ClickableCell
+                    value={metric.devTestingIterations}
+                    items={metric.devIterationItems}
+                    title={`${metric.tester} - ${t('devIterations')}`}
+                    className="badge-dev"
+                  />
+                </td>
                 <td>{formatNumber(metric.avgDevIterationsPerTask, 2)}</td>
-                <td><span className="badge-stg">{metric.stgTestingIterations}</span></td>
+                <td>
+                  <ClickableCell
+                    value={metric.stgTestingIterations}
+                    items={metric.stgIterationItems}
+                    title={`${metric.tester} - ${t('stgIterations')}`}
+                    className="badge-stg"
+                  />
+                </td>
                 <td>{formatNumber(metric.avgStgIterationsPerTask, 2)}</td>
-                <td>{metric.prCommentsCount}</td>
+                <td>
+                  <ClickablePrCell
+                    value={metric.prCommentsCount}
+                    items={metric.prCommentDetails}
+                    title={`${metric.tester} - ${t('prCommentsShort')}`}
+                  />
+                </td>
                 <td>{formatNumber(metric.avgPrCommentsPerPr, 2)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+
+      <DrillDownModal
+        open={drillDownOpen}
+        onOpenChange={setDrillDownOpen}
+        title={drillDownTitle}
+        items={drillDownItems}
+        organization={organization}
+        project={project}
+      />
+      
+      <PRDrillDownModal
+        open={prDrillDownOpen}
+        onOpenChange={setPrDrillDownOpen}
+        title={prDrillDownTitle}
+        prDetails={prDrillDownItems}
+        organization={organization}
+        project={project}
+      />
     </div>
   );
 }

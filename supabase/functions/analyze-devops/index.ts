@@ -21,89 +21,28 @@ const STATES = {
   PAUSED: 'Paused',
 } as const;
 
-// Enhanced debug interfaces for manual validation
-interface TestingPeriod {
-  start: string;
-  end: string;
-  hours: number;
-}
+// Batching configuration - NO LIMITS, just batch sizes for API efficiency
+const WORK_ITEM_BATCH_SIZE = 200; // Azure DevOps API limit
+const REVISION_BATCH_SIZE = 20;   // Parallel revision fetches
+const PR_BATCH_SIZE = 15;         // Parallel PR thread fetches
 
-interface TestingCycleDebug {
-  cycleIndex: number;
-  env: 'DEV' | 'STG';
-  tester: string;
-  cycleStart: string;
-  cycleEnd: string;
-  endReason: string;
-  totalCycleHours: number;
-  mergedPeriods: TestingPeriod[];
-  iterationCounted: boolean;
-  iterationReason: string;
-}
-
-interface WorkItemDebugLog {
-  workItemId: number;
+// Drill-down data interfaces
+interface WorkItemReference {
+  id: number;
+  title: string;
   type: string;
-  finalState: string;
-  transitions: Array<{
-    timestamp: string;
-    fromState: string;
-    toState: string;
-    changedBy: string | null;
-    assignedTo: string | null;
-  }>;
-  development: {
-    activePeriods: Array<{
-      start: string;
-      end: string;
-      hoursAdded: number;
-      closeReason: string;
-      developer: string;
-    }>;
-    totalActiveHours: number;
-    participatesInDevAvg: boolean;
-    reason: string;
-  };
-  devTesting: {
-    cycles: TestingCycleDebug[];
-    totalTestingHours: number;
-    totalIterations: number;
-  };
-  stgTesting: {
-    cycles: TestingCycleDebug[];
-    totalTestingHours: number;
-    totalIterations: number;
-  };
-  returns: Array<{
-    fromState: string;
-    toState: string;
-    developer: string;
-    type: string;
-  }>;
-  prComments: Array<{
-    prId: string;
-    author: string;
-    counted: boolean;
-    reason: string;
-  }>;
-  aggregation: {
-    taskDevTestingTotalHours: number;
-    taskStgTestingTotalHours: number;
-    taskDevIterations: number;
-    taskStgIterations: number;
-    includedInAverages: boolean;
-  };
+  url: string;
+  count: number;
+  assignedToChanged: boolean;
+  assignedToHistory: string[];
 }
 
-// Debug logging is conditionally enabled based on query size
-let DEBUG_ENABLED = true;
-const MAX_DEBUG_ITEMS = 50;
-const MAX_WORK_ITEMS = 200; // Hard limit to prevent CPU timeout
-
-function emitWorkItemDebugLog(log: WorkItemDebugLog) {
-  if (DEBUG_ENABLED) {
-    console.log('[WORK_ITEM_DEBUG]', JSON.stringify(log, null, 2));
-  }
+interface PRReference {
+  prId: string;
+  prUrl: string;
+  workItemId: number;
+  workItemTitle: string;
+  commentsCount: number;
 }
 
 interface WorkItemRevision {
@@ -140,6 +79,12 @@ interface DeveloperMetrics {
   avgCodeReviewReturnsPerTask: number;
   avgDevTestingReturnsPerTask: number;
   avgStgTestingReturnsPerTask: number;
+  // Drill-down lists
+  workItems: WorkItemReference[];
+  returnItems: WorkItemReference[];
+  codeReviewReturnItems: WorkItemReference[];
+  devTestingReturnItems: WorkItemReference[];
+  stgTestingReturnItems: WorkItemReference[];
 }
 
 interface TesterMetrics {
@@ -157,12 +102,18 @@ interface TesterMetrics {
   avgPrCommentsPerPr: number;
   tasksWorkedOn: number;
   prsReviewed: number;
+  // Drill-down lists
+  closedItems: WorkItemReference[];
+  devIterationItems: WorkItemReference[];
+  stgIterationItems: WorkItemReference[];
+  prCommentDetails: PRReference[];
 }
 
 interface PRCommentAuthor {
   author: string;
   count: number;
   isTester: boolean;
+  prDetails: PRReference[];
 }
 
 /**
@@ -186,7 +137,7 @@ async function azureRequest(url: string, pat: string): Promise<unknown> {
 }
 
 /**
- * Execute a saved query to get work item IDs
+ * Execute a saved query to get ALL work item IDs (no limits)
  */
 async function executeQuery(
   organization: string,
@@ -205,7 +156,7 @@ async function executeQuery(
 }
 
 /**
- * Get work items with relations
+ * Get work items with relations in batches (Azure API limit is 200)
  */
 async function getWorkItems(
   organization: string,
@@ -215,14 +166,14 @@ async function getWorkItems(
 ): Promise<WorkItem[]> {
   if (ids.length === 0) return [];
 
-  const batchSize = 200;
   const allWorkItems: WorkItem[] = [];
 
-  for (let i = 0; i < ids.length; i += batchSize) {
-    const batchIds = ids.slice(i, i + batchSize);
+  for (let i = 0; i < ids.length; i += WORK_ITEM_BATCH_SIZE) {
+    const batchIds = ids.slice(i, i + WORK_ITEM_BATCH_SIZE);
     const idsParam = batchIds.join(',');
     const url = `https://dev.azure.com/${organization}/${project}/_apis/wit/workitems?ids=${idsParam}&$expand=relations&api-version=7.1`;
     
+    console.log(`Fetching work items batch ${Math.floor(i / WORK_ITEM_BATCH_SIZE) + 1}/${Math.ceil(ids.length / WORK_ITEM_BATCH_SIZE)}`);
     const result = await azureRequest(url, pat) as { value: WorkItem[] };
     allWorkItems.push(...result.value);
   }
@@ -256,6 +207,39 @@ function getDisplayName(field: unknown): string | null {
 }
 
 /**
+ * Extract AssignedTo history from revisions
+ */
+function extractAssignedToHistory(revisions: WorkItemRevision[]): string[] {
+  const history: string[] = [];
+  let lastAssignedTo: string | null = null;
+  
+  for (const rev of revisions) {
+    const assignedTo = getDisplayName(rev.fields['System.AssignedTo']);
+    if (assignedTo && assignedTo !== lastAssignedTo) {
+      history.push(assignedTo);
+      lastAssignedTo = assignedTo;
+    }
+  }
+  
+  return history;
+}
+
+/**
+ * Get current or last known AssignedTo
+ */
+function getCurrentAssignedTo(workItem: WorkItem, assignedToHistory: string[]): string {
+  const current = getDisplayName(workItem.fields['System.AssignedTo']);
+  if (current) return current;
+  
+  // Fallback to last known from history
+  if (assignedToHistory.length > 0) {
+    return assignedToHistory[assignedToHistory.length - 1];
+  }
+  
+  return 'Unassigned';
+}
+
+/**
  * Extract state transitions from revisions with AssignedTo and ChangedBy at each transition
  */
 function extractTransitions(revisions: WorkItemRevision[], workItemId: number): TransitionEvent[] {
@@ -283,432 +267,82 @@ function extractTransitions(revisions: WorkItemRevision[], workItemId: number): 
 /**
  * Calculate development time: SUM of ALL Active periods until first DEV_Acceptance Testing
  */
-function calculateDevelopmentTime(transitions: TransitionEvent[], workItemId: number): {
+function calculateDevelopmentTime(transitions: TransitionEvent[]): {
   totalHours: number;
   cycles: number;
-  developerCycles: Map<string, { totalHours: number; cycles: number }>;
-  debugPeriods: Array<{ start: string; end: string; hoursAdded: number; closeReason: string; developer: string }>;
   stoppedAtAcceptance: boolean;
 } {
-  const developerCycles = new Map<string, { totalHours: number; cycles: number }>();
-  const debugPeriods: Array<{ start: string; end: string; hoursAdded: number; closeReason: string; developer: string }> = [];
   let totalHours = 0;
   let cycles = 0;
   let activeStartTimestamp: Date | null = null;
 
   for (const t of transitions) {
-    // Check if we've reached DEV_Acceptance Testing - stop collecting Active periods
     if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
-      // Close any open Active period first
       if (activeStartTimestamp) {
         const hours = (t.timestamp.getTime() - activeStartTimestamp.getTime()) / (1000 * 60 * 60);
         totalHours += hours;
         cycles++;
-
-        const developer = t.assignedTo || 'Unassigned';
-        if (!developerCycles.has(developer)) {
-          developerCycles.set(developer, { totalHours: 0, cycles: 0 });
-        }
-        const devData = developerCycles.get(developer)!;
-        devData.totalHours += hours;
-        devData.cycles++;
-
-        debugPeriods.push({
-          start: activeStartTimestamp.toISOString(),
-          end: t.timestamp.toISOString(),
-          hoursAdded: Math.round(hours * 100) / 100,
-          closeReason: 'Transition to DEV_Acceptance Testing (Code Review skipped)',
-          developer,
-        });
-
         activeStartTimestamp = null;
       }
-      // Stop processing - we've reached first DEV_Acceptance Testing
-      return { totalHours, cycles, developerCycles, debugPeriods, stoppedAtAcceptance: true };
+      return { totalHours, cycles, stoppedAtAcceptance: true };
     }
 
-    // Entering Active state
     if (t.toState === STATES.ACTIVE) {
       activeStartTimestamp = t.timestamp;
     }
-    // Leaving Active state (to Code Review or any other state)
     else if (t.fromState === STATES.ACTIVE && activeStartTimestamp) {
       const hours = (t.timestamp.getTime() - activeStartTimestamp.getTime()) / (1000 * 60 * 60);
       totalHours += hours;
       cycles++;
-
-      const developer = t.assignedTo || 'Unassigned';
-      if (!developerCycles.has(developer)) {
-        developerCycles.set(developer, { totalHours: 0, cycles: 0 });
-      }
-      const devData = developerCycles.get(developer)!;
-      devData.totalHours += hours;
-      devData.cycles++;
-
-      debugPeriods.push({
-        start: activeStartTimestamp.toISOString(),
-        end: t.timestamp.toISOString(),
-        hoursAdded: Math.round(hours * 100) / 100,
-        closeReason: `Transition to ${t.toState}`,
-        developer,
-      });
-
       activeStartTimestamp = null;
     }
   }
 
-  return { totalHours, cycles, developerCycles, debugPeriods, stoppedAtAcceptance: false };
+  return { totalHours, cycles, stoppedAtAcceptance: false };
 }
 
 /**
  * Count returns to Fix Required
  */
-function countReturns(transitions: TransitionEvent[], workItemId: number): {
+function countReturns(transitions: TransitionEvent[]): {
   codeReviewReturns: number;
   devTestingReturns: number;
   stgTestingReturns: number;
-  returnsByDeveloper: Map<string, { codeReview: number; devTesting: number; stgTesting: number }>;
-  debugReturns: Array<{ fromState: string; toState: string; developer: string; type: string }>;
+  totalReturns: number;
 } {
   let codeReviewReturns = 0;
   let devTestingReturns = 0;
   let stgTestingReturns = 0;
-  const returnsByDeveloper = new Map<string, { codeReview: number; devTesting: number; stgTesting: number }>();
-  const debugReturns: Array<{ fromState: string; toState: string; developer: string; type: string }> = [];
-
-  let lastKnownDeveloper: string | null = null;
 
   for (const t of transitions) {
-    if (t.fromState === STATES.ACTIVE && 
-        (t.toState === STATES.CODE_REVIEW || t.toState === STATES.DEV_ACCEPTANCE_TESTING)) {
-      lastKnownDeveloper = t.assignedTo;
-    }
-
     if (t.toState === STATES.FIX_REQUIRED) {
-      const developer = lastKnownDeveloper || 'Unassigned';
-      
-      if (!returnsByDeveloper.has(developer)) {
-        returnsByDeveloper.set(developer, { codeReview: 0, devTesting: 0, stgTesting: 0 });
-      }
-      const devReturns = returnsByDeveloper.get(developer)!;
-      let returnType = 'unknown';
-
       if (t.fromState === STATES.CODE_REVIEW) {
         codeReviewReturns++;
-        devReturns.codeReview++;
-        returnType = 'Code Review';
       } else if (t.fromState === STATES.DEV_IN_TESTING || t.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
         devTestingReturns++;
-        devReturns.devTesting++;
-        returnType = 'DEV Testing';
       } else if (t.fromState === STATES.STG_IN_TESTING || t.fromState === STATES.STG_ACCEPTANCE_TESTING) {
         stgTestingReturns++;
-        devReturns.stgTesting++;
-        returnType = 'STG Testing';
       }
-
-      debugReturns.push({
-        fromState: t.fromState,
-        toState: t.toState,
-        developer,
-        type: returnType,
-      });
     }
   }
 
-  return { codeReviewReturns, devTestingReturns, stgTestingReturns, returnsByDeveloper, debugReturns };
+  return { 
+    codeReviewReturns, 
+    devTestingReturns, 
+    stgTestingReturns,
+    totalReturns: codeReviewReturns + devTestingReturns + stgTestingReturns
+  };
 }
 
 /**
  * Calculate DEV testing metrics with corrected cycle logic
- * 
- * CYCLE START: ANY → DEV_In Testing
- * CYCLE END: ANY transition FROM DEV_In Testing
- * 
- * EXCEPTION (merge rule):
- * - DEV_In Testing → DEV_Acceptance Testing → DEV_In Testing
- * - Same tester (changedBy) on both In Testing transitions
- * - No other states in between (only Acceptance)
- * => Merge into ONE cycle, sum the In Testing periods
- * 
- * All other transitions from DEV_In Testing close the cycle
  */
 function calculateDevTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
   metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
-  debugCycles: TestingCycleDebug[];
   totalIterations: number;
   totalTestingHours: number;
 } {
   const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
-  const debugCycles: TestingCycleDebug[] = [];
-  
-  let currentCycle: {
-    tester: string;
-    cycleStart: Date;
-    inTestingStart: Date;
-    periods: Array<{ start: Date; end: Date; hours: number }>;
-    pendingMerge: boolean; // True when we're in Acceptance and might merge
-    pendingMergeEnd: Date | null;
-  } | null = null;
-  
-  let totalIterations = 0;
-  let totalTestingHours = 0;
-  let cycleIndex = 0;
-  
-  function closeCycle(endTime: Date, endReason: string) {
-    if (!currentCycle) return;
-    
-    // Calculate total hours for this cycle (sum of all periods)
-    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
-    
-    // Update tester metrics
-    if (!testerMetrics.has(currentCycle.tester)) {
-      testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
-    }
-    const data = testerMetrics.get(currentCycle.tester)!;
-    data.totalHours += cycleTotalHours;
-    data.cycles++;
-    data.iterations++; // 1 cycle = 1 iteration
-    totalIterations++;
-    totalTestingHours += cycleTotalHours;
-    
-    cycleIndex++;
-    
-    // Debug log with enhanced structure
-    debugCycles.push({
-      cycleIndex,
-      env: 'DEV',
-      tester: currentCycle.tester,
-      cycleStart: currentCycle.cycleStart.toISOString(),
-      cycleEnd: endTime.toISOString(),
-      endReason,
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-      mergedPeriods: currentCycle.periods.map(p => ({
-        start: p.start.toISOString(),
-        end: p.end.toISOString(),
-        hours: Math.round(p.hours * 100) / 100,
-      })),
-      iterationCounted: true,
-      iterationReason: 'One completed cycle = one iteration',
-    });
-    
-    console.log('[DEV_CYCLE_CLOSED]', JSON.stringify({
-      workItemId,
-      cycleIndex,
-      tester: currentCycle.tester,
-      endReason,
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-      periodsCount: currentCycle.periods.length,
-    }));
-    
-    currentCycle = null;
-  }
-  
-  for (let i = 0; i < transitions.length; i++) {
-    const t = transitions[i];
-    
-    // Transition INTO DEV_In Testing from ANY state
-    if (t.toState === STATES.DEV_IN_TESTING) {
-      const currentTester = t.changedBy || t.assignedTo || 'Unknown';
-      
-      console.log('[DEV_TRANSITION]', JSON.stringify({
-        workItemId,
-        event: 'TO_IN_TESTING',
-        fromState: t.fromState,
-        tester: currentTester,
-        timestamp: t.timestamp.toISOString(),
-        hasCycle: !!currentCycle,
-        pendingMerge: currentCycle?.pendingMerge,
-        cycleTester: currentCycle?.tester,
-      }));
-      
-      // Check if we can merge (coming from Acceptance, same tester)
-      if (currentCycle && currentCycle.pendingMerge && 
-          t.fromState === STATES.DEV_ACCEPTANCE_TESTING &&
-          currentCycle.tester === currentTester) {
-        // MERGE: Add a new period to the existing cycle
-        currentCycle.periods.push({
-          start: t.timestamp,
-          end: t.timestamp, // Will be updated when we leave In Testing
-          hours: 0,
-        });
-        currentCycle.pendingMerge = false;
-        currentCycle.pendingMergeEnd = null;
-        currentCycle.inTestingStart = t.timestamp;
-        
-        console.log('[DEV_CYCLE_MERGE]', JSON.stringify({
-          workItemId,
-          tester: currentTester,
-          reason: 'Same tester returning from Acceptance, merging periods',
-          periodsCount: currentCycle.periods.length,
-        }));
-      } else {
-        // Close any existing cycle first (different tester or not from Acceptance)
-        if (currentCycle) {
-          const closeTime = currentCycle.pendingMergeEnd || t.timestamp;
-          const closeReason = currentCycle.pendingMerge 
-            ? `Different tester took over (was: ${currentCycle.tester}, now: ${currentTester})`
-            : 'New cycle started';
-          closeCycle(closeTime, closeReason);
-        }
-        
-        // Start new cycle
-        currentCycle = {
-          tester: currentTester,
-          cycleStart: t.timestamp,
-          inTestingStart: t.timestamp,
-          periods: [{ start: t.timestamp, end: t.timestamp, hours: 0 }],
-          pendingMerge: false,
-          pendingMergeEnd: null,
-        };
-        
-        console.log('[DEV_CYCLE_START]', JSON.stringify({
-          workItemId,
-          tester: currentTester,
-          cycleStart: t.timestamp.toISOString(),
-          fromState: t.fromState,
-        }));
-      }
-    }
-    // Transition FROM DEV_In Testing to ANY other state
-    else if (t.fromState === STATES.DEV_IN_TESTING && currentCycle) {
-      // Calculate hours for current In Testing period
-      const hours = (t.timestamp.getTime() - currentCycle.inTestingStart.getTime()) / (1000 * 60 * 60);
-      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
-      lastPeriod.end = t.timestamp;
-      lastPeriod.hours = hours;
-      
-      console.log('[DEV_FROM_IN_TESTING]', JSON.stringify({
-        workItemId,
-        toState: t.toState,
-        periodHours: Math.round(hours * 100) / 100,
-        tester: currentCycle.tester,
-      }));
-      
-      // Special case: In Testing → Acceptance Testing (potential merge)
-      if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
-        // Check if next transition is back to In Testing by same tester
-        let canMerge = false;
-        let nextInTestingTester: string | null = null;
-        
-        for (let j = i + 1; j < transitions.length; j++) {
-          const nextT = transitions[j];
-          if (nextT.toState === STATES.DEV_IN_TESTING) {
-            nextInTestingTester = nextT.changedBy || nextT.assignedTo || 'Unknown';
-            if (nextT.fromState === STATES.DEV_ACCEPTANCE_TESTING && nextInTestingTester === currentCycle.tester) {
-              canMerge = true;
-            }
-            break;
-          }
-          // If any other state appears before next In Testing, cannot merge
-          if (nextT.toState !== STATES.DEV_ACCEPTANCE_TESTING && nextT.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
-            break;
-          }
-        }
-        
-        if (canMerge) {
-          // Keep cycle open, mark as pending merge
-          currentCycle.pendingMerge = true;
-          currentCycle.pendingMergeEnd = t.timestamp;
-          
-          console.log('[DEV_PENDING_MERGE]', JSON.stringify({
-            workItemId,
-            tester: currentCycle.tester,
-            reason: 'Moved to Acceptance, next In Testing is by same tester',
-          }));
-        } else {
-          // Close the cycle
-          const closeReason = nextInTestingTester && nextInTestingTester !== currentCycle.tester
-            ? `Acceptance Testing → different tester will take over (${nextInTestingTester})`
-            : 'Acceptance Testing → no merge possible';
-          closeCycle(t.timestamp, closeReason);
-        }
-      } else {
-        // Any other transition from In Testing closes the cycle
-        closeCycle(t.timestamp, `Transition to ${t.toState}`);
-      }
-    }
-    // Handle case where we're in pending merge state and something else happens from Acceptance
-    else if (currentCycle && currentCycle.pendingMerge && t.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
-      // If toState is not In Testing, close the cycle
-      if (t.toState !== STATES.DEV_IN_TESTING) {
-        closeCycle(t.timestamp, `From Acceptance to ${t.toState} (merge cancelled)`);
-      }
-    }
-  }
-  
-  // Close any remaining open cycle (incomplete)
-  if (currentCycle) {
-    const lastTransition = transitions[transitions.length - 1];
-    // For incomplete cycles, still count as iteration but note it
-    const closeTime = currentCycle.pendingMergeEnd || lastTransition?.timestamp || new Date();
-    
-    // Calculate remaining hours if still in testing
-    if (currentCycle.periods.length > 0) {
-      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
-      if (lastPeriod.hours === 0 && lastPeriod.end.getTime() === lastPeriod.start.getTime()) {
-        // Period was never closed, use last transition time
-        lastPeriod.end = closeTime;
-        lastPeriod.hours = (closeTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
-      }
-    }
-    
-    // Don't count incomplete cycles as iterations
-    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
-    
-    if (!testerMetrics.has(currentCycle.tester)) {
-      testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
-    }
-    const data = testerMetrics.get(currentCycle.tester)!;
-    data.totalHours += cycleTotalHours;
-    data.cycles++;
-    // Don't increment iterations for incomplete cycles
-    totalTestingHours += cycleTotalHours;
-    
-    cycleIndex++;
-    
-    debugCycles.push({
-      cycleIndex,
-      env: 'DEV',
-      tester: currentCycle.tester,
-      cycleStart: currentCycle.cycleStart.toISOString(),
-      cycleEnd: closeTime.toISOString(),
-      endReason: 'End of transitions (cycle incomplete)',
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-      mergedPeriods: currentCycle.periods.map(p => ({
-        start: p.start.toISOString(),
-        end: p.end.toISOString(),
-        hours: Math.round(p.hours * 100) / 100,
-      })),
-      iterationCounted: false,
-      iterationReason: 'Cycle not completed - no closing transition',
-    });
-    
-    console.log('[DEV_CYCLE_INCOMPLETE]', JSON.stringify({
-      workItemId,
-      cycleIndex,
-      tester: currentCycle.tester,
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-    }));
-    
-    currentCycle = null;
-  }
-  
-  return { metrics: testerMetrics, debugCycles, totalIterations, totalTestingHours };
-}
-
-/**
- * Calculate STG testing metrics with corrected cycle logic
- * Same logic as DEV but for STG states
- */
-function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
-  metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
-  debugCycles: TestingCycleDebug[];
-  totalIterations: number;
-  totalTestingHours: number;
-} {
-  const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
-  const debugCycles: TestingCycleDebug[] = [];
   
   let currentCycle: {
     tester: string;
@@ -721,9 +355,8 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
   
   let totalIterations = 0;
   let totalTestingHours = 0;
-  let cycleIndex = 0;
   
-  function closeCycle(endTime: Date, endReason: string) {
+  function closeCycle(endTime: Date) {
     if (!currentCycle) return;
     
     const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
@@ -738,33 +371,136 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
     totalIterations++;
     totalTestingHours += cycleTotalHours;
     
-    cycleIndex++;
+    currentCycle = null;
+  }
+  
+  for (let i = 0; i < transitions.length; i++) {
+    const t = transitions[i];
     
-    debugCycles.push({
-      cycleIndex,
-      env: 'STG',
-      tester: currentCycle.tester,
-      cycleStart: currentCycle.cycleStart.toISOString(),
-      cycleEnd: endTime.toISOString(),
-      endReason,
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-      mergedPeriods: currentCycle.periods.map(p => ({
-        start: p.start.toISOString(),
-        end: p.end.toISOString(),
-        hours: Math.round(p.hours * 100) / 100,
-      })),
-      iterationCounted: true,
-      iterationReason: 'One completed cycle = one iteration',
-    });
+    if (t.toState === STATES.DEV_IN_TESTING) {
+      const currentTester = t.changedBy || t.assignedTo || 'Unknown';
+      
+      if (currentCycle && currentCycle.pendingMerge && 
+          t.fromState === STATES.DEV_ACCEPTANCE_TESTING &&
+          currentCycle.tester === currentTester) {
+        currentCycle.periods.push({
+          start: t.timestamp,
+          end: t.timestamp,
+          hours: 0,
+        });
+        currentCycle.pendingMerge = false;
+        currentCycle.pendingMergeEnd = null;
+        currentCycle.inTestingStart = t.timestamp;
+      } else {
+        if (currentCycle) {
+          const closeTime = currentCycle.pendingMergeEnd || t.timestamp;
+          closeCycle(closeTime);
+        }
+        
+        currentCycle = {
+          tester: currentTester,
+          cycleStart: t.timestamp,
+          inTestingStart: t.timestamp,
+          periods: [{ start: t.timestamp, end: t.timestamp, hours: 0 }],
+          pendingMerge: false,
+          pendingMergeEnd: null,
+        };
+      }
+    }
+    else if (t.fromState === STATES.DEV_IN_TESTING && currentCycle) {
+      const hours = (t.timestamp.getTime() - currentCycle.inTestingStart.getTime()) / (1000 * 60 * 60);
+      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
+      lastPeriod.end = t.timestamp;
+      lastPeriod.hours = hours;
+      
+      if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
+        let canMerge = false;
+        
+        for (let j = i + 1; j < transitions.length; j++) {
+          const nextT = transitions[j];
+          if (nextT.toState === STATES.DEV_IN_TESTING) {
+            const nextTester = nextT.changedBy || nextT.assignedTo || 'Unknown';
+            if (nextT.fromState === STATES.DEV_ACCEPTANCE_TESTING && nextTester === currentCycle.tester) {
+              canMerge = true;
+            }
+            break;
+          }
+          if (nextT.toState !== STATES.DEV_ACCEPTANCE_TESTING && nextT.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
+            break;
+          }
+        }
+        
+        if (canMerge) {
+          currentCycle.pendingMerge = true;
+          currentCycle.pendingMergeEnd = t.timestamp;
+        } else {
+          closeCycle(t.timestamp);
+        }
+      } else {
+        closeCycle(t.timestamp);
+      }
+    }
+    else if (currentCycle && currentCycle.pendingMerge && t.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
+      if (t.toState !== STATES.DEV_IN_TESTING) {
+        closeCycle(t.timestamp);
+      }
+    }
+  }
+  
+  if (currentCycle) {
+    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
     
-    console.log('[STG_CYCLE_CLOSED]', JSON.stringify({
-      workItemId,
-      cycleIndex,
-      tester: currentCycle.tester,
-      endReason,
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-      periodsCount: currentCycle.periods.length,
-    }));
+    if (!testerMetrics.has(currentCycle.tester)) {
+      testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
+    }
+    const data = testerMetrics.get(currentCycle.tester)!;
+    data.totalHours += cycleTotalHours;
+    data.cycles++;
+    // Don't count incomplete cycles as iterations
+    totalTestingHours += cycleTotalHours;
+    
+    currentCycle = null;
+  }
+  
+  return { metrics: testerMetrics, totalIterations, totalTestingHours };
+}
+
+/**
+ * Calculate STG testing metrics with corrected cycle logic
+ */
+function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: number): {
+  metrics: Map<string, { totalHours: number; cycles: number; iterations: number }>;
+  totalIterations: number;
+  totalTestingHours: number;
+} {
+  const testerMetrics = new Map<string, { totalHours: number; cycles: number; iterations: number }>();
+  
+  let currentCycle: {
+    tester: string;
+    cycleStart: Date;
+    inTestingStart: Date;
+    periods: Array<{ start: Date; end: Date; hours: number }>;
+    pendingMerge: boolean;
+    pendingMergeEnd: Date | null;
+  } | null = null;
+  
+  let totalIterations = 0;
+  let totalTestingHours = 0;
+  
+  function closeCycle(endTime: Date) {
+    if (!currentCycle) return;
+    
+    const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
+    
+    if (!testerMetrics.has(currentCycle.tester)) {
+      testerMetrics.set(currentCycle.tester, { totalHours: 0, cycles: 0, iterations: 0 });
+    }
+    const data = testerMetrics.get(currentCycle.tester)!;
+    data.totalHours += cycleTotalHours;
+    data.cycles++;
+    data.iterations++;
+    totalIterations++;
+    totalTestingHours += cycleTotalHours;
     
     currentCycle = null;
   }
@@ -774,17 +510,6 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
     
     if (t.toState === STATES.STG_IN_TESTING) {
       const currentTester = t.changedBy || t.assignedTo || 'Unknown';
-      
-      console.log('[STG_TRANSITION]', JSON.stringify({
-        workItemId,
-        event: 'TO_IN_TESTING',
-        fromState: t.fromState,
-        tester: currentTester,
-        timestamp: t.timestamp.toISOString(),
-        hasCycle: !!currentCycle,
-        pendingMerge: currentCycle?.pendingMerge,
-        cycleTester: currentCycle?.tester,
-      }));
       
       if (currentCycle && currentCycle.pendingMerge && 
           t.fromState === STATES.STG_ACCEPTANCE_TESTING &&
@@ -797,20 +522,10 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
         currentCycle.pendingMerge = false;
         currentCycle.pendingMergeEnd = null;
         currentCycle.inTestingStart = t.timestamp;
-        
-        console.log('[STG_CYCLE_MERGE]', JSON.stringify({
-          workItemId,
-          tester: currentTester,
-          reason: 'Same tester returning from Acceptance, merging periods',
-          periodsCount: currentCycle.periods.length,
-        }));
       } else {
         if (currentCycle) {
           const closeTime = currentCycle.pendingMergeEnd || t.timestamp;
-          const closeReason = currentCycle.pendingMerge 
-            ? `Different tester took over (was: ${currentCycle.tester}, now: ${currentTester})`
-            : 'New cycle started';
-          closeCycle(closeTime, closeReason);
+          closeCycle(closeTime);
         }
         
         currentCycle = {
@@ -821,13 +536,6 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
           pendingMerge: false,
           pendingMergeEnd: null,
         };
-        
-        console.log('[STG_CYCLE_START]', JSON.stringify({
-          workItemId,
-          tester: currentTester,
-          cycleStart: t.timestamp.toISOString(),
-          fromState: t.fromState,
-        }));
       }
     }
     else if (t.fromState === STATES.STG_IN_TESTING && currentCycle) {
@@ -836,22 +544,14 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
       lastPeriod.end = t.timestamp;
       lastPeriod.hours = hours;
       
-      console.log('[STG_FROM_IN_TESTING]', JSON.stringify({
-        workItemId,
-        toState: t.toState,
-        periodHours: Math.round(hours * 100) / 100,
-        tester: currentCycle.tester,
-      }));
-      
       if (t.toState === STATES.STG_ACCEPTANCE_TESTING) {
         let canMerge = false;
-        let nextInTestingTester: string | null = null;
         
         for (let j = i + 1; j < transitions.length; j++) {
           const nextT = transitions[j];
           if (nextT.toState === STATES.STG_IN_TESTING) {
-            nextInTestingTester = nextT.changedBy || nextT.assignedTo || 'Unknown';
-            if (nextT.fromState === STATES.STG_ACCEPTANCE_TESTING && nextInTestingTester === currentCycle.tester) {
+            const nextTester = nextT.changedBy || nextT.assignedTo || 'Unknown';
+            if (nextT.fromState === STATES.STG_ACCEPTANCE_TESTING && nextTester === currentCycle.tester) {
               canMerge = true;
             }
             break;
@@ -864,42 +564,21 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
         if (canMerge) {
           currentCycle.pendingMerge = true;
           currentCycle.pendingMergeEnd = t.timestamp;
-          
-          console.log('[STG_PENDING_MERGE]', JSON.stringify({
-            workItemId,
-            tester: currentCycle.tester,
-            reason: 'Moved to Acceptance, next In Testing is by same tester',
-          }));
         } else {
-          const closeReason = nextInTestingTester && nextInTestingTester !== currentCycle.tester
-            ? `Acceptance Testing → different tester will take over (${nextInTestingTester})`
-            : 'Acceptance Testing → no merge possible';
-          closeCycle(t.timestamp, closeReason);
+          closeCycle(t.timestamp);
         }
       } else {
-        closeCycle(t.timestamp, `Transition to ${t.toState}`);
+        closeCycle(t.timestamp);
       }
     }
     else if (currentCycle && currentCycle.pendingMerge && t.fromState === STATES.STG_ACCEPTANCE_TESTING) {
       if (t.toState !== STATES.STG_IN_TESTING) {
-        closeCycle(t.timestamp, `From Acceptance to ${t.toState} (merge cancelled)`);
+        closeCycle(t.timestamp);
       }
     }
   }
   
-  // Close any remaining open cycle (incomplete)
   if (currentCycle) {
-    const lastTransition = transitions[transitions.length - 1];
-    const closeTime = currentCycle.pendingMergeEnd || lastTransition?.timestamp || new Date();
-    
-    if (currentCycle.periods.length > 0) {
-      const lastPeriod = currentCycle.periods[currentCycle.periods.length - 1];
-      if (lastPeriod.hours === 0 && lastPeriod.end.getTime() === lastPeriod.start.getTime()) {
-        lastPeriod.end = closeTime;
-        lastPeriod.hours = (closeTime.getTime() - lastPeriod.start.getTime()) / (1000 * 60 * 60);
-      }
-    }
-    
     const cycleTotalHours = currentCycle.periods.reduce((sum, p) => sum + p.hours, 0);
     
     if (!testerMetrics.has(currentCycle.tester)) {
@@ -910,40 +589,14 @@ function calculateStgTestingMetrics(transitions: TransitionEvent[], workItemId: 
     data.cycles++;
     totalTestingHours += cycleTotalHours;
     
-    cycleIndex++;
-    
-    debugCycles.push({
-      cycleIndex,
-      env: 'STG',
-      tester: currentCycle.tester,
-      cycleStart: currentCycle.cycleStart.toISOString(),
-      cycleEnd: closeTime.toISOString(),
-      endReason: 'End of transitions (cycle incomplete)',
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-      mergedPeriods: currentCycle.periods.map(p => ({
-        start: p.start.toISOString(),
-        end: p.end.toISOString(),
-        hours: Math.round(p.hours * 100) / 100,
-      })),
-      iterationCounted: false,
-      iterationReason: 'Cycle not completed - no closing transition',
-    });
-    
-    console.log('[STG_CYCLE_INCOMPLETE]', JSON.stringify({
-      workItemId,
-      cycleIndex,
-      tester: currentCycle.tester,
-      totalCycleHours: Math.round(cycleTotalHours * 100) / 100,
-    }));
-    
     currentCycle = null;
   }
   
-  return { metrics: testerMetrics, debugCycles, totalIterations, totalTestingHours };
+  return { metrics: testerMetrics, totalIterations, totalTestingHours };
 }
 
 /**
- * Get PR comments from linked PRs
+ * Get PR comments from linked PRs - returns detailed PR info for drill-down
  */
 async function getPRComments(
   organization: string,
@@ -951,21 +604,21 @@ async function getPRComments(
   workItem: WorkItem,
   pat: string
 ): Promise<{ 
-  commentsByAuthor: Map<string, number>; 
+  commentsByAuthor: Map<string, { count: number; prDetails: PRReference[] }>;
   prCount: number;
-  debugComments: Array<{ prId: string; author: string; counted: boolean; reason: string }>;
 }> {
-  const commentsByAuthor = new Map<string, number>();
-  const debugComments: Array<{ prId: string; author: string; counted: boolean; reason: string }> = [];
+  const commentsByAuthor = new Map<string, { count: number; prDetails: PRReference[] }>();
   let prCount = 0;
   
   if (!workItem.relations) {
-    return { commentsByAuthor, prCount, debugComments };
+    return { commentsByAuthor, prCount };
   }
   
   const prLinks = workItem.relations.filter(
     r => r.rel === 'ArtifactLink' && r.url.includes('PullRequestId')
   );
+  
+  const workItemTitle = workItem.fields['System.Title'] as string;
   
   for (const link of prLinks) {
     try {
@@ -974,37 +627,47 @@ async function getPRComments(
       
       const repoId = match[1];
       const prId = match[2];
-      prCount++;
       
       const threadsUrl = `https://dev.azure.com/${organization}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=7.1`;
-      const threadsResult = await azureRequest(threadsUrl, pat) as { value: Array<{ comments: Array<{ author: { displayName: string }; parentCommentId?: number; commentType?: string }> }> };
+      const threads = await azureRequest(threadsUrl, pat) as { value: Array<{ comments: Array<{ author: { displayName: string }; commentType: string }> }> };
       
-      for (const thread of threadsResult.value || []) {
-        for (const comment of thread.comments || []) {
-          const author = comment.author?.displayName || 'Unknown';
-          const isTopLevel = !comment.parentCommentId;
-          const isSystem = comment.commentType === 'system';
-
-          if (!isTopLevel) {
-            debugComments.push({ prId, author, counted: false, reason: 'Reply (has parentCommentId)' });
-            continue;
+      prCount++;
+      const prUrl = `https://dev.azure.com/${organization}/${project}/_git/${repoId}/pullrequest/${prId}`;
+      
+      for (const thread of threads.value) {
+        if (thread.comments && thread.comments.length > 0) {
+          const firstComment = thread.comments[0];
+          if (firstComment.commentType === 'text') {
+            const author = firstComment.author.displayName;
+            
+            if (!commentsByAuthor.has(author)) {
+              commentsByAuthor.set(author, { count: 0, prDetails: [] });
+            }
+            const authorData = commentsByAuthor.get(author)!;
+            authorData.count++;
+            
+            // Check if we already have this PR in the list
+            const existingPr = authorData.prDetails.find(p => p.prId === prId);
+            if (existingPr) {
+              existingPr.commentsCount++;
+            } else {
+              authorData.prDetails.push({
+                prId,
+                prUrl,
+                workItemId: workItem.id,
+                workItemTitle,
+                commentsCount: 1,
+              });
+            }
           }
-          
-          if (isSystem) {
-            debugComments.push({ prId, author, counted: false, reason: 'System comment' });
-            continue;
-          }
-          
-          commentsByAuthor.set(author, (commentsByAuthor.get(author) || 0) + 1);
-          debugComments.push({ prId, author, counted: true, reason: 'Valid top-level comment' });
         }
       }
-    } catch {
-      console.log(`Could not access PR for work item ${workItem.id}`);
+    } catch (e) {
+      console.log(`Could not access PR for work item ${workItem.id}: ${e}`);
     }
   }
   
-  return { commentsByAuthor, prCount, debugComments };
+  return { commentsByAuthor, prCount };
 }
 
 serve(async (req) => {
@@ -1019,18 +682,11 @@ serve(async (req) => {
       throw new Error('Missing required fields: organization, project, queryId, pat');
     }
 
-    console.log(`Starting analysis for ${organization}/${project}`);
+    console.log(`Starting analysis for ${organization}/${project} - NO LIMITS MODE`);
 
+    // Step 1: Get ALL work item IDs from query (no limit)
     const workItemIds = await executeQuery(organization, project, queryId, pat);
-    console.log(`Found ${workItemIds.length} work items`);
-
-    // Disable verbose debug logging for large queries to prevent CPU timeout
-    if (workItemIds.length > MAX_DEBUG_ITEMS) {
-      DEBUG_ENABLED = false;
-      console.log(`Debug logging disabled for ${workItemIds.length} items (threshold: ${MAX_DEBUG_ITEMS})`);
-    } else {
-      DEBUG_ENABLED = true;
-    }
+    console.log(`Found ${workItemIds.length} work items - processing ALL`);
 
     if (workItemIds.length === 0) {
       return new Response(
@@ -1051,24 +707,21 @@ serve(async (req) => {
           },
           chartData: {
             developmentSpeed: [],
-            testingSpeed: [],
+            devTestingSpeed: [],
+            stgTestingSpeed: [],
             returns: [],
-            iterations: [],
+            devIterations: [],
+            stgIterations: [],
             prComments: [],
           },
+          unassignedItems: [],
         }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Limit work items to prevent CPU timeout
-    const limitedWorkItemIds = workItemIds.slice(0, MAX_WORK_ITEMS);
-    const wasLimited = workItemIds.length > MAX_WORK_ITEMS;
-    if (wasLimited) {
-      console.log(`WARNING: Query returned ${workItemIds.length} items, limiting to ${MAX_WORK_ITEMS} most recent`);
-    }
-
-    const workItems = await getWorkItems(organization, project, limitedWorkItemIds, pat);
+    // Step 2: Fetch ALL work items in batches
+    const workItems = await getWorkItems(organization, project, workItemIds, pat);
     console.log(`Fetched ${workItems.length} work items with details`);
 
     const requirements = workItems.filter(wi => wi.fields['System.WorkItemType'] === 'Requirement');
@@ -1076,10 +729,10 @@ serve(async (req) => {
     const tasks = workItems.filter(wi => wi.fields['System.WorkItemType'] === 'Task');
     
     const metricsItems = [...requirements, ...bugs];
-    const prItems = workItems;
 
     console.log(`Processing ${requirements.length} requirements, ${bugs.length} bugs, ${tasks.length} tasks`);
 
+    // Aggregation structures with drill-down data
     const developerData: Map<string, {
       totalDevHours: number;
       devCycles: number;
@@ -1088,10 +741,15 @@ serve(async (req) => {
       stgTestingReturns: number;
       itemsCompleted: number;
       tasksWorkedOn: Set<number>;
+      workItems: Map<number, WorkItemReference>;
+      returnItems: Map<number, WorkItemReference>;
+      codeReviewReturnItems: Map<number, WorkItemReference>;
+      devTestingReturnItems: Map<number, WorkItemReference>;
+      stgTestingReturnItems: Map<number, WorkItemReference>;
     }> = new Map();
 
     const testerData: Map<string, {
-      closedItems: Set<number>;
+      closedItems: Map<number, WorkItemReference>;
       totalDevTestingHours: number;
       devTestingCycles: number;
       totalStgTestingHours: number;
@@ -1100,24 +758,29 @@ serve(async (req) => {
       stgIterations: number;
       tasksWorkedOn: Set<number>;
       prsReviewed: number;
+      devIterationItems: Map<number, WorkItemReference>;
+      stgIterationItems: Map<number, WorkItemReference>;
+      prCommentDetails: PRReference[];
     }> = new Map();
 
-    const allPrComments: Map<string, number> = new Map();
+    const allPrComments: Map<string, { count: number; prDetails: PRReference[] }> = new Map();
     const prCountByAuthor: Map<string, number> = new Map();
     const allTesters = new Set<string>();
+    const unassignedItems: WorkItemReference[] = [];
 
     let numTasks = 0;
     let globalDevTotalHours = 0;
     let globalDevTestingTotalHours = 0;
     let globalStgTestingTotalHours = 0;
 
-    // Process work items in batches to avoid CPU timeout
-    const METRICS_BATCH_SIZE = 15;
-    console.log(`Processing ${metricsItems.length} items in batches of ${METRICS_BATCH_SIZE}`);
+    // Step 3: Process work items for metrics in batches
+    const totalBatches = Math.ceil(metricsItems.length / REVISION_BATCH_SIZE);
+    console.log(`Processing ${metricsItems.length} metrics items in ${totalBatches} batches`);
     
-    for (let batchStart = 0; batchStart < metricsItems.length; batchStart += METRICS_BATCH_SIZE) {
-      const batch = metricsItems.slice(batchStart, batchStart + METRICS_BATCH_SIZE);
-      console.log(`Processing batch ${Math.floor(batchStart / METRICS_BATCH_SIZE) + 1} (items ${batchStart + 1}-${batchStart + batch.length})`);
+    for (let batchStart = 0; batchStart < metricsItems.length; batchStart += REVISION_BATCH_SIZE) {
+      const batch = metricsItems.slice(batchStart, batchStart + REVISION_BATCH_SIZE);
+      const batchNum = Math.floor(batchStart / REVISION_BATCH_SIZE) + 1;
+      console.log(`Metrics batch ${batchNum}/${totalBatches} (items ${batchStart + 1}-${batchStart + batch.length})`);
       
       // Fetch all revisions for this batch in parallel
       const batchRevisions = await Promise.all(
@@ -1131,79 +794,99 @@ serve(async (req) => {
         const transitions = extractTransitions(revisions, workItem.id);
         
         const workItemType = workItem.fields['System.WorkItemType'] as string;
-        const finalState = workItem.fields['System.State'] as string;
+        const workItemTitle = workItem.fields['System.Title'] as string;
+        const assignedToHistory = extractAssignedToHistory(revisions);
+        const currentAssignedTo = getCurrentAssignedTo(workItem, assignedToHistory);
+        const workItemUrl = `https://dev.azure.com/${organization}/${project}/_workitems/edit/${workItem.id}`;
+        
+        const workItemRef: WorkItemReference = {
+          id: workItem.id,
+          title: workItemTitle,
+          type: workItemType,
+          url: workItemUrl,
+          count: 0,
+          assignedToChanged: assignedToHistory.length > 1,
+          assignedToHistory,
+        };
         
         numTasks++;
         
+        // Collect testers
         const tester1 = getDisplayName(workItem.fields['Custom.TestedBy1']);
         const tester2 = getDisplayName(workItem.fields['Custom.TestedBy2']);
         if (tester1) allTesters.add(tester1);
         if (tester2) allTesters.add(tester2);
         
-        const devTimeResult = calculateDevelopmentTime(transitions, workItem.id);
+        // Development time - aggregate by CURRENT Assigned To
+        const devTimeResult = calculateDevelopmentTime(transitions);
         globalDevTotalHours += devTimeResult.totalHours;
 
-        for (const [developer, data] of devTimeResult.developerCycles) {
-          if (!developerData.has(developer)) {
-            developerData.set(developer, {
-              totalDevHours: 0,
-              devCycles: 0,
-              codeReviewReturns: 0,
-              devTestingReturns: 0,
-              stgTestingReturns: 0,
-              itemsCompleted: 0,
-              tasksWorkedOn: new Set(),
-            });
-          }
-          const devData = developerData.get(developer)!;
-          devData.totalDevHours += data.totalHours;
-          devData.devCycles += data.cycles;
-          devData.tasksWorkedOn.add(workItem.id);
+        // Initialize developer data if needed
+        if (!developerData.has(currentAssignedTo)) {
+          developerData.set(currentAssignedTo, {
+            totalDevHours: 0,
+            devCycles: 0,
+            codeReviewReturns: 0,
+            devTestingReturns: 0,
+            stgTestingReturns: 0,
+            itemsCompleted: 0,
+            tasksWorkedOn: new Set(),
+            workItems: new Map(),
+            returnItems: new Map(),
+            codeReviewReturnItems: new Map(),
+            devTestingReturnItems: new Map(),
+            stgTestingReturnItems: new Map(),
+          });
+        }
+        const devData = developerData.get(currentAssignedTo)!;
+        devData.totalDevHours += devTimeResult.totalHours;
+        devData.devCycles += devTimeResult.cycles;
+        devData.tasksWorkedOn.add(workItem.id);
+        
+        // Add to workItems drill-down
+        if (!devData.workItems.has(workItem.id)) {
+          devData.workItems.set(workItem.id, { ...workItemRef, count: 1 });
         }
         
-        const returns = countReturns(transitions, workItem.id);
-
-        for (const [developer, returnData] of returns.returnsByDeveloper) {
-          if (!developerData.has(developer)) {
-            developerData.set(developer, {
-              totalDevHours: 0,
-              devCycles: 0,
-              codeReviewReturns: 0,
-              devTestingReturns: 0,
-              stgTestingReturns: 0,
-              itemsCompleted: 0,
-              tasksWorkedOn: new Set(),
-            });
-          }
-          const devData = developerData.get(developer)!;
-          devData.codeReviewReturns += returnData.codeReview;
-          devData.devTestingReturns += returnData.devTesting;
-          devData.stgTestingReturns += returnData.stgTesting;
-          devData.tasksWorkedOn.add(workItem.id);
+        // Track unassigned
+        if (currentAssignedTo === 'Unassigned') {
+          unassignedItems.push({ ...workItemRef, count: 1 });
+        }
+        
+        // Returns - aggregate by CURRENT Assigned To
+        const returns = countReturns(transitions);
+        devData.codeReviewReturns += returns.codeReviewReturns;
+        devData.devTestingReturns += returns.devTestingReturns;
+        devData.stgTestingReturns += returns.stgTestingReturns;
+        
+        // Add to return drill-downs
+        if (returns.totalReturns > 0) {
+          const returnRef = { ...workItemRef, count: returns.totalReturns };
+          devData.returnItems.set(workItem.id, returnRef);
+        }
+        if (returns.codeReviewReturns > 0) {
+          devData.codeReviewReturnItems.set(workItem.id, { ...workItemRef, count: returns.codeReviewReturns });
+        }
+        if (returns.devTestingReturns > 0) {
+          devData.devTestingReturnItems.set(workItem.id, { ...workItemRef, count: returns.devTestingReturns });
+        }
+        if (returns.stgTestingReturns > 0) {
+          devData.stgTestingReturnItems.set(workItem.id, { ...workItemRef, count: returns.stgTestingReturns });
         }
 
+        // Items completed (Released)
         if (workItem.fields['System.State'] === STATES.RELEASED) {
-          let maxCyclesDev: string | null = null;
-          let maxCycles = 0;
-          for (const [dev, data] of devTimeResult.developerCycles) {
-            if (data.cycles > maxCycles) {
-              maxCycles = data.cycles;
-              maxCyclesDev = dev;
-            }
-          }
-          if (maxCyclesDev && developerData.has(maxCyclesDev)) {
-            developerData.get(maxCyclesDev)!.itemsCompleted++;
-          }
+          devData.itemsCompleted++;
         }
         
+        // DEV Testing metrics
         const devTestingResult = calculateDevTestingMetrics(transitions, workItem.id);
-        const taskDevTestingTotalHours = devTestingResult.totalTestingHours;
-        const taskDevIterations = devTestingResult.totalIterations;
+        globalDevTestingTotalHours += devTestingResult.totalTestingHours;
 
         for (const [tester, data] of devTestingResult.metrics) {
           if (!testerData.has(tester)) {
             testerData.set(tester, {
-              closedItems: new Set(),
+              closedItems: new Map(),
               totalDevTestingHours: 0,
               devTestingCycles: 0,
               totalStgTestingHours: 0,
@@ -1212,6 +895,9 @@ serve(async (req) => {
               stgIterations: 0,
               tasksWorkedOn: new Set(),
               prsReviewed: 0,
+              devIterationItems: new Map(),
+              stgIterationItems: new Map(),
+              prCommentDetails: [],
             });
           }
           const testData = testerData.get(tester)!;
@@ -1220,20 +906,31 @@ serve(async (req) => {
           testData.devIterations += data.iterations;
           testData.tasksWorkedOn.add(workItem.id);
           
+          // Add to DEV iteration drill-down
+          if (data.iterations > 0) {
+            const existingItem = testData.devIterationItems.get(workItem.id);
+            if (existingItem) {
+              existingItem.count += data.iterations;
+            } else {
+              testData.devIterationItems.set(workItem.id, { ...workItemRef, count: data.iterations });
+            }
+          }
+          
           if (workItem.fields['System.State'] === STATES.RELEASED) {
-            testData.closedItems.add(workItem.id);
+            if (!testData.closedItems.has(workItem.id)) {
+              testData.closedItems.set(workItem.id, { ...workItemRef, count: 1 });
+            }
           }
         }
-        globalDevTestingTotalHours += taskDevTestingTotalHours;
 
+        // STG Testing metrics
         const stgTestingResult = calculateStgTestingMetrics(transitions, workItem.id);
-        const taskStgTestingTotalHours = stgTestingResult.totalTestingHours;
-        const taskStgIterations = stgTestingResult.totalIterations;
+        globalStgTestingTotalHours += stgTestingResult.totalTestingHours;
 
         for (const [tester, data] of stgTestingResult.metrics) {
           if (!testerData.has(tester)) {
             testerData.set(tester, {
-              closedItems: new Set(),
+              closedItems: new Map(),
               totalDevTestingHours: 0,
               devTestingCycles: 0,
               totalStgTestingHours: 0,
@@ -1242,6 +939,9 @@ serve(async (req) => {
               stgIterations: 0,
               tasksWorkedOn: new Set(),
               prsReviewed: 0,
+              devIterationItems: new Map(),
+              stgIterationItems: new Map(),
+              prCommentDetails: [],
             });
           }
           const testData = testerData.get(tester)!;
@@ -1250,109 +950,63 @@ serve(async (req) => {
           testData.stgIterations += data.iterations;
           testData.tasksWorkedOn.add(workItem.id);
           
+          // Add to STG iteration drill-down
+          if (data.iterations > 0) {
+            const existingItem = testData.stgIterationItems.get(workItem.id);
+            if (existingItem) {
+              existingItem.count += data.iterations;
+            } else {
+              testData.stgIterationItems.set(workItem.id, { ...workItemRef, count: data.iterations });
+            }
+          }
+          
           if (workItem.fields['System.State'] === STATES.RELEASED) {
-            testData.closedItems.add(workItem.id);
-          }
-        }
-        globalStgTestingTotalHours += taskStgTestingTotalHours;
-
-        // Emit structured debug log for this work item (only if debug enabled)
-        if (DEBUG_ENABLED) {
-          const debugLog: WorkItemDebugLog = {
-            workItemId: workItem.id,
-            type: workItemType,
-            finalState,
-            transitions: transitions.map(t => ({
-              timestamp: t.timestamp.toISOString(),
-              fromState: t.fromState,
-              toState: t.toState,
-              changedBy: t.changedBy,
-              assignedTo: t.assignedTo,
-            })),
-            development: {
-              activePeriods: devTimeResult.debugPeriods,
-              totalActiveHours: Math.round(devTimeResult.totalHours * 100) / 100,
-              participatesInDevAvg: devTimeResult.totalHours > 0,
-              reason: devTimeResult.stoppedAtAcceptance 
-                ? `Stopped at first DEV_Acceptance Testing with ${devTimeResult.cycles} cycle(s)` 
-                : devTimeResult.totalHours > 0 
-                  ? `Has ${devTimeResult.cycles} development cycle(s)` 
-                  : 'No completed Active periods found',
-            },
-            devTesting: {
-              cycles: devTestingResult.debugCycles,
-              totalTestingHours: Math.round(taskDevTestingTotalHours * 100) / 100,
-              totalIterations: taskDevIterations,
-            },
-            stgTesting: {
-              cycles: stgTestingResult.debugCycles,
-              totalTestingHours: Math.round(taskStgTestingTotalHours * 100) / 100,
-              totalIterations: taskStgIterations,
-            },
-            returns: returns.debugReturns,
-            prComments: [],
-            aggregation: {
-              taskDevTestingTotalHours: Math.round(taskDevTestingTotalHours * 100) / 100,
-              taskStgTestingTotalHours: Math.round(taskStgTestingTotalHours * 100) / 100,
-              taskDevIterations,
-              taskStgIterations,
-              includedInAverages: true,
-            },
-          };
-          
-          emitWorkItemDebugLog(debugLog);
-        }
-      }
-    }
-
-    // Process PR comments in batches - skip for large queries to save CPU
-    const skipPrComments = metricsItems.length > 100;
-    if (skipPrComments) {
-      console.log(`Skipping PR comments processing for ${metricsItems.length} items to save CPU time`);
-    } else {
-      const PR_BATCH_SIZE = 10;
-      for (let i = 0; i < prItems.length; i += PR_BATCH_SIZE) {
-        const batch = prItems.slice(i, i + PR_BATCH_SIZE);
-        
-        // Process batch in parallel
-        const batchResults = await Promise.all(
-          batch.map(workItem => getPRComments(organization, project, workItem, pat))
-        );
-        
-        for (let j = 0; j < batch.length; j++) {
-          const workItem = batch[j];
-          const { commentsByAuthor, prCount, debugComments } = batchResults[j];
-          
-          if (DEBUG_ENABLED && debugComments.length > 0) {
-            console.log('[PR_COMMENTS_DEBUG]', JSON.stringify({
-              workItemId: workItem.id,
-              prCount,
-              comments: debugComments,
-            }, null, 2));
-          }
-          
-          for (const [author, count] of commentsByAuthor) {
-            allPrComments.set(author, (allPrComments.get(author) || 0) + count);
-            prCountByAuthor.set(author, (prCountByAuthor.get(author) || 0) + prCount);
-            
-            if (testerData.has(author)) {
-              testerData.get(author)!.prsReviewed += prCount;
+            if (!testData.closedItems.has(workItem.id)) {
+              testData.closedItems.set(workItem.id, { ...workItemRef, count: 1 });
             }
           }
         }
       }
     }
 
-    // Log final averaging info
-    console.log('[AVERAGING_SUMMARY]', JSON.stringify({
-      numTasksForAverage: numTasks,
-      globalDevTotalHours: Math.round(globalDevTotalHours * 100) / 100,
-      globalDevTestingTotalHours: Math.round(globalDevTestingTotalHours * 100) / 100,
-      globalStgTestingTotalHours: Math.round(globalStgTestingTotalHours * 100) / 100,
-      avgDevTimeHours: numTasks > 0 ? Math.round((globalDevTotalHours / numTasks) * 100) / 100 : 0,
-      avgDevTestTimeHours: numTasks > 0 ? Math.round((globalDevTestingTotalHours / numTasks) * 100) / 100 : 0,
-      avgStgTestTimeHours: numTasks > 0 ? Math.round((globalStgTestingTotalHours / numTasks) * 100) / 100 : 0,
-    }, null, 2));
+    // Step 4: Process ALL PR comments in batches (NO SKIPPING)
+    const prTotalBatches = Math.ceil(workItems.length / PR_BATCH_SIZE);
+    console.log(`Processing PR comments for ${workItems.length} items in ${prTotalBatches} batches`);
+    
+    for (let i = 0; i < workItems.length; i += PR_BATCH_SIZE) {
+      const batch = workItems.slice(i, i + PR_BATCH_SIZE);
+      const batchNum = Math.floor(i / PR_BATCH_SIZE) + 1;
+      console.log(`PR batch ${batchNum}/${prTotalBatches}`);
+      
+      // Process batch in parallel
+      const batchResults = await Promise.all(
+        batch.map(workItem => getPRComments(organization, project, workItem, pat))
+      );
+      
+      for (let j = 0; j < batch.length; j++) {
+        const { commentsByAuthor, prCount } = batchResults[j];
+        
+        for (const [author, data] of commentsByAuthor) {
+          if (!allPrComments.has(author)) {
+            allPrComments.set(author, { count: 0, prDetails: [] });
+          }
+          const authorData = allPrComments.get(author)!;
+          authorData.count += data.count;
+          authorData.prDetails.push(...data.prDetails);
+          
+          prCountByAuthor.set(author, (prCountByAuthor.get(author) || 0) + prCount);
+          
+          // Add PR details to tester data
+          if (testerData.has(author)) {
+            testerData.get(author)!.prsReviewed += prCount;
+            testerData.get(author)!.prCommentDetails.push(...data.prDetails);
+          }
+        }
+      }
+    }
+
+    // Step 5: Build final metrics with drill-down data
+    console.log(`Building final metrics...`);
 
     const developerMetrics: DeveloperMetrics[] = Array.from(developerData.entries())
       .map(([developer, data]) => {
@@ -1372,6 +1026,12 @@ serve(async (req) => {
           avgCodeReviewReturnsPerTask: taskCount > 0 ? data.codeReviewReturns / taskCount : 0,
           avgDevTestingReturnsPerTask: taskCount > 0 ? data.devTestingReturns / taskCount : 0,
           avgStgTestingReturnsPerTask: taskCount > 0 ? data.stgTestingReturns / taskCount : 0,
+          // Drill-down lists
+          workItems: Array.from(data.workItems.values()),
+          returnItems: Array.from(data.returnItems.values()),
+          codeReviewReturnItems: Array.from(data.codeReviewReturnItems.values()),
+          devTestingReturnItems: Array.from(data.devTestingReturnItems.values()),
+          stgTestingReturnItems: Array.from(data.stgTestingReturnItems.values()),
         };
       })
       .sort((a, b) => b.itemsCompleted - a.itemsCompleted);
@@ -1380,7 +1040,7 @@ serve(async (req) => {
       .map(([tester, data]) => {
         const taskCount = data.tasksWorkedOn.size;
         const prCount = data.prsReviewed || prCountByAuthor.get(tester) || 0;
-        const commentCount = allPrComments.get(tester) || 0;
+        const commentCount = allPrComments.get(tester)?.count || 0;
         
         return {
           tester,
@@ -1397,20 +1057,26 @@ serve(async (req) => {
           avgPrCommentsPerPr: prCount > 0 ? commentCount / prCount : 0,
           tasksWorkedOn: taskCount,
           prsReviewed: prCount,
+          // Drill-down lists
+          closedItems: Array.from(data.closedItems.values()),
+          devIterationItems: Array.from(data.devIterationItems.values()),
+          stgIterationItems: Array.from(data.stgIterationItems.values()),
+          prCommentDetails: data.prCommentDetails,
         };
       })
       .sort((a, b) => b.closedItemsCount - a.closedItemsCount);
 
     const prCommentAuthors: PRCommentAuthor[] = Array.from(allPrComments.entries())
-      .map(([author, count]) => ({
+      .map(([author, data]) => ({
         author,
-        count,
+        count: data.count,
         isTester: allTesters.has(author),
+        prDetails: data.prDetails,
       }))
       .sort((a, b) => b.count - a.count);
 
     const totalReturns = developerMetrics.reduce((sum, d) => sum + d.totalReturnCount, 0);
-    const totalPrComments = Array.from(allPrComments.values()).reduce((sum, count) => sum + count, 0);
+    const totalPrComments = Array.from(allPrComments.values()).reduce((sum, d) => sum + d.count, 0);
 
     const summary = {
       totalWorkItems: workItems.length,
@@ -1422,9 +1088,6 @@ serve(async (req) => {
       avgStgTestTimeHours: numTasks > 0 ? globalStgTestingTotalHours / numTasks : 0,
       totalReturns,
       totalPrComments,
-      wasLimited,
-      originalCount: workItemIds.length,
-      prCommentsSkipped: skipPrComments,
     };
 
     const chartData = {
@@ -1457,7 +1120,7 @@ serve(async (req) => {
         .map(p => ({ name: p.author, value: p.count, isTester: p.isTester })),
     };
 
-    console.log(`Analysis complete. Developers: ${developerMetrics.length}, Testers: ${testerMetrics.length}`);
+    console.log(`Analysis complete. Developers: ${developerMetrics.length}, Testers: ${testerMetrics.length}, Total items: ${workItems.length}`);
 
     return new Response(
       JSON.stringify({
@@ -1466,6 +1129,7 @@ serve(async (req) => {
         prCommentAuthors,
         summary,
         chartData,
+        unassignedItems,
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
