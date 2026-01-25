@@ -98,6 +98,7 @@ export const labels = {
   prId: 'PR ID',
   workItem: 'Рабочий элемент',
   commentsCount: 'Комментариев',
+  authors: 'Авторы',
   openPr: 'Открыть PR',
   
   // Unassigned
