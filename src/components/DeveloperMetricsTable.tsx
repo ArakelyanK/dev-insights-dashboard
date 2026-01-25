@@ -11,6 +11,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
+
 interface DeveloperMetricsTableProps {
   metrics: DeveloperMetrics[];
   organization: string;
@@ -32,18 +33,11 @@ type SortField =
 
 type SortDirection = 'asc' | 'desc';
 
-interface DrillDownState {
-  open: boolean;
-  title: string;
-  items: WorkItemReference[];
-}
-
-export function DeveloperMetricsTable({ metrics, organization, project }: DeveloperMetricsTableProps) {
+export function DeveloperMetricsTable({ metrics }: DeveloperMetricsTableProps) {
   const [sortField, setSortField] = useState<SortField>('itemsCompleted');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [selectedDevelopers, setSelectedDevelopers] = useState<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = useState(false);
-  const [drillDown, setDrillDown] = useState<DrillDownState>({ open: false, title: '', items: [] });
 
   const allDevelopers = useMemo(() => 
     metrics.map(m => m.developer).sort((a, b) => a.localeCompare(b)),
@@ -78,12 +72,10 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
   const filteredAndSortedMetrics = useMemo(() => {
     let result = [...metrics];
     
-    // Apply filter
     if (selectedDevelopers.size > 0) {
       result = result.filter(m => selectedDevelopers.has(m.developer));
     }
     
-    // Apply sort
     result.sort((a, b) => {
       let aVal: string | number = a[sortField];
       let bVal: string | number = b[sortField];
@@ -99,10 +91,6 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
     
     return result;
   }, [metrics, sortField, sortDirection, selectedDevelopers]);
-
-  const openDrillDown = (title: string, items: WorkItemReference[]) => {
-    setDrillDown({ open: true, title, items });
-  };
 
   const SortIcon = ({ field }: { field: SortField }) => {
     if (sortField !== field) return <ArrowUpDown className="h-3 w-3 ml-1 opacity-50" />;
@@ -225,15 +213,6 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
           </tbody>
         </table>
       </div>
-
-      <DrillDownModal
-        open={drillDown.open}
-        onOpenChange={(open) => setDrillDown(prev => ({ ...prev, open }))}
-        title={drillDown.title}
-        items={drillDown.items}
-        organization={organization}
-        project={project}
-      />
     </div>
   );
 }

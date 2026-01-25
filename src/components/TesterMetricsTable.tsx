@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import type { TesterMetrics, WorkItemReference, PRReference } from "@/types/metrics";
+import type { TesterMetrics } from "@/types/metrics";
 import { formatDuration, formatNumber } from "@/lib/formatters";
 import { t } from "@/lib/i18n";
 import { ArrowUpDown, ArrowUp, ArrowDown, Filter, X } from "lucide-react";
@@ -11,9 +11,6 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { ClickableMetric } from "./ClickableMetric";
-import { DrillDownModal } from "./DrillDownModal";
-import { PRDrillDownModal } from "./PRDrillDownModal";
 
 interface TesterMetricsTableProps {
   metrics: TesterMetrics[];
@@ -35,25 +32,11 @@ type SortField =
 
 type SortDirection = 'asc' | 'desc';
 
-interface DrillDownState {
-  open: boolean;
-  title: string;
-  items: WorkItemReference[];
-}
-
-interface PRDrillDownState {
-  open: boolean;
-  title: string;
-  prDetails: PRReference[];
-}
-
-export function TesterMetricsTable({ metrics, organization, project }: TesterMetricsTableProps) {
+export function TesterMetricsTable({ metrics }: TesterMetricsTableProps) {
   const [sortField, setSortField] = useState<SortField>('closedItemsCount');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [selectedTesters, setSelectedTesters] = useState<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = useState(false);
-  const [drillDown, setDrillDown] = useState<DrillDownState>({ open: false, title: '', items: [] });
-  const [prDrillDown, setPrDrillDown] = useState<PRDrillDownState>({ open: false, title: '', prDetails: [] });
 
   const allTesters = useMemo(() => 
     metrics.map(m => m.tester).sort((a, b) => a.localeCompare(b)),
@@ -88,12 +71,10 @@ export function TesterMetricsTable({ metrics, organization, project }: TesterMet
   const filteredAndSortedMetrics = useMemo(() => {
     let result = [...metrics];
     
-    // Apply filter
     if (selectedTesters.size > 0) {
       result = result.filter(m => selectedTesters.has(m.tester));
     }
     
-    // Apply sort
     result.sort((a, b) => {
       let aVal: string | number = a[sortField];
       let bVal: string | number = b[sortField];
@@ -109,14 +90,6 @@ export function TesterMetricsTable({ metrics, organization, project }: TesterMet
     
     return result;
   }, [metrics, sortField, sortDirection, selectedTesters]);
-
-  const openDrillDown = (title: string, items: WorkItemReference[]) => {
-    setDrillDown({ open: true, title, items });
-  };
-
-  const openPrDrillDown = (title: string, prDetails: PRReference[]) => {
-    setPrDrillDown({ open: true, title, prDetails });
-  };
 
   const SortIcon = ({ field }: { field: SortField }) => {
     if (sortField !== field) return <ArrowUpDown className="h-3 w-3 ml-1 opacity-50" />;
@@ -219,70 +192,20 @@ export function TesterMetricsTable({ metrics, organization, project }: TesterMet
             {filteredAndSortedMetrics.map((metric, index) => (
               <tr key={metric.tester} style={{ animationDelay: `${index * 50}ms` }}>
                 <td className="font-medium">{metric.tester}</td>
-                <td>
-                  <ClickableMetric
-                    value={<span className="badge-success">{metric.closedItemsCount}</span>}
-                    onClick={metric.closedItems?.length > 0 ? () => openDrillDown(
-                      `${metric.tester}: ${t('closedItems')}`,
-                      metric.closedItems
-                    ) : undefined}
-                  />
-                </td>
+                <td><span className="badge-success">{metric.closedItemsCount}</span></td>
                 <td>{formatDuration(metric.avgDevTestTimeHours)}</td>
                 <td>{formatDuration(metric.avgStgTestTimeHours)}</td>
-                <td>
-                  <ClickableMetric
-                    value={<span className="badge-dev">{metric.devTestingIterations}</span>}
-                    onClick={metric.devIterationItems?.length > 0 ? () => openDrillDown(
-                      `${metric.tester}: ${t('devIterations')}`,
-                      metric.devIterationItems
-                    ) : undefined}
-                  />
-                </td>
+                <td><span className="badge-dev">{metric.devTestingIterations}</span></td>
                 <td>{formatNumber(metric.avgDevIterationsPerTask, 2)}</td>
-                <td>
-                  <ClickableMetric
-                    value={<span className="badge-stg">{metric.stgTestingIterations}</span>}
-                    onClick={metric.stgIterationItems?.length > 0 ? () => openDrillDown(
-                      `${metric.tester}: ${t('stgIterations')}`,
-                      metric.stgIterationItems
-                    ) : undefined}
-                  />
-                </td>
+                <td><span className="badge-stg">{metric.stgTestingIterations}</span></td>
                 <td>{formatNumber(metric.avgStgIterationsPerTask, 2)}</td>
-                <td>
-                  <ClickableMetric
-                    value={metric.prCommentsCount}
-                    onClick={metric.prCommentDetails?.length > 0 ? () => openPrDrillDown(
-                      `${metric.tester}: ${t('prCommentsShort')}`,
-                      metric.prCommentDetails
-                    ) : undefined}
-                  />
-                </td>
+                <td>{metric.prCommentsCount}</td>
                 <td>{formatNumber(metric.avgPrCommentsPerPr, 2)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-
-      <DrillDownModal
-        open={drillDown.open}
-        onOpenChange={(open) => setDrillDown(prev => ({ ...prev, open }))}
-        title={drillDown.title}
-        items={drillDown.items}
-        organization={organization}
-        project={project}
-      />
-
-      <PRDrillDownModal
-        open={prDrillDown.open}
-        onOpenChange={(open) => setPrDrillDown(prev => ({ ...prev, open }))}
-        title={prDrillDown.title}
-        prDetails={prDrillDown.prDetails}
-        organization={organization}
-        project={project}
-      />
     </div>
   );
 }

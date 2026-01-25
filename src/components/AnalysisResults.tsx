@@ -2,12 +2,10 @@ import { useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { MetricCard } from "./MetricCard";
 import { DeveloperMetricsTable } from "./DeveloperMetricsTable";
 import { TesterMetricsTable } from "./TesterMetricsTable";
 import { MetricsCharts } from "./MetricsCharts";
-import { DrillDownModal } from "./DrillDownModal";
 import type { AnalysisResult } from "@/types/metrics";
 import { t } from "@/lib/i18n";
 import { 
@@ -21,8 +19,7 @@ import {
   Table,
   Bug,
   FileText,
-  ListTodo,
-  AlertTriangle
+  ListTodo
 } from "lucide-react";
 import { formatDuration } from "@/lib/formatters";
 
@@ -34,8 +31,7 @@ interface AnalysisResultsProps {
 }
 
 export function AnalysisResults({ result, onBack, organization, project }: AnalysisResultsProps) {
-  const { summary, developerMetrics, testerMetrics, chartData, unassignedItems } = result;
-  const [unassignedOpen, setUnassignedOpen] = useState(false);
+  const { summary, developerMetrics, testerMetrics, chartData } = result;
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -52,24 +48,6 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
           {t('newAnalysis')}
         </Button>
       </div>
-
-      {/* Unassigned Warning */}
-      {unassignedItems && unassignedItems.length > 0 && (
-        <div className="p-4 rounded-lg bg-warning/10 border border-warning/30 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <AlertTriangle className="h-5 w-5 text-warning" />
-            <div>
-              <p className="font-medium text-foreground">{t('unassignedItems')}</p>
-              <p className="text-sm text-muted-foreground">
-                {unassignedItems.length} элементов без назначенного исполнителя
-              </p>
-            </div>
-          </div>
-          <Button variant="outline" size="sm" onClick={() => setUnassignedOpen(true)}>
-            {t('viewUnassigned')}
-          </Button>
-        </div>
-      )}
 
       {/* Summary Metrics */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
@@ -202,16 +180,6 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
           <MetricsCharts chartData={chartData} />
         </TabsContent>
       </Tabs>
-
-      {/* Unassigned Modal */}
-      <DrillDownModal
-        open={unassignedOpen}
-        onOpenChange={setUnassignedOpen}
-        title={t('unassignedItems')}
-        items={unassignedItems || []}
-        organization={organization}
-        project={project}
-      />
     </div>
   );
 }
