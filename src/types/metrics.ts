@@ -7,44 +7,76 @@ export interface AnalysisRequest {
   pat: string;
 }
 
+// Drill-down work item reference
+export interface WorkItemReference {
+  id: number;
+  title: string;
+  type: string;
+  url: string;
+  count: number; // Count for this specific metric (e.g., returns count, iterations count)
+  assignedToChanged: boolean;
+  assignedToHistory: string[];
+}
+
+// PR reference for drill-down
+export interface PRReference {
+  prId: string;
+  prUrl: string;
+  workItemId: number;
+  workItemTitle: string;
+  commentsCount: number;
+}
+
 export interface DeveloperMetrics {
   developer: string;
-  avgDevTimeHours: number; // Renamed from developmentSpeedHours
+  avgDevTimeHours: number;
   developmentCycles: number;
   totalReturnCount: number;
   codeReviewReturns: number;
   devTestingReturns: number;
   stgTestingReturns: number;
   itemsCompleted: number;
-  // New per-task averages
+  // Per-task averages
   avgTotalReturnsPerTask: number;
   avgCodeReviewReturnsPerTask: number;
   avgDevTestingReturnsPerTask: number;
   avgStgTestingReturnsPerTask: number;
+  // Drill-down data
+  workItems: WorkItemReference[];
+  returnItems: WorkItemReference[];
+  codeReviewReturnItems: WorkItemReference[];
+  devTestingReturnItems: WorkItemReference[];
+  stgTestingReturnItems: WorkItemReference[];
 }
 
 export interface TesterMetrics {
   tester: string;
   closedItemsCount: number;
-  avgDevTestTimeHours: number; // Renamed from avgDevTestingSpeedHours
-  avgStgTestTimeHours: number; // Renamed from avgStgTestingSpeedHours
+  avgDevTestTimeHours: number;
+  avgStgTestTimeHours: number;
   devTestingCycles: number;
   stgTestingCycles: number;
   devTestingIterations: number;
   stgTestingIterations: number;
   prCommentsCount: number;
-  // New per-task averages
+  // Per-task averages
   avgDevIterationsPerTask: number;
   avgStgIterationsPerTask: number;
   avgPrCommentsPerPr: number;
   tasksWorkedOn: number;
   prsReviewed: number;
+  // Drill-down data
+  closedItems: WorkItemReference[];
+  devIterationItems: WorkItemReference[];
+  stgIterationItems: WorkItemReference[];
+  prCommentDetails: PRReference[];
 }
 
 export interface PRCommentAuthor {
   author: string;
   count: number;
   isTester: boolean;
+  prDetails: PRReference[];
 }
 
 export interface ChartDataPoint {
@@ -66,19 +98,23 @@ export interface AnalysisResult {
     totalRequirements: number;
     totalBugs: number;
     totalTasks: number;
-    avgDevTimeHours: number; // Renamed
-    avgDevTestTimeHours: number; // Renamed
-    avgStgTestTimeHours: number; // Renamed
+    avgDevTimeHours: number;
+    avgDevTestTimeHours: number;
+    avgStgTestTimeHours: number;
     totalReturns: number;
     totalPrComments: number;
   };
   chartData: {
     developmentSpeed: ChartDataPoint[];
-    testingSpeed: ChartDataPoint[];
+    devTestingSpeed: ChartDataPoint[];
+    stgTestingSpeed: ChartDataPoint[];
     returns: ChartDataPoint[];
-    iterations: ChartDataPoint[];
+    devIterations: ChartDataPoint[];
+    stgIterations: ChartDataPoint[];
     prComments: PRChartDataPoint[];
   };
+  // Unassigned items for drill-down
+  unassignedItems: WorkItemReference[];
 }
 
 export interface WorkItemRevision {
@@ -122,6 +158,7 @@ export const STATES = {
   STG_IN_TESTING: 'STG_In Testing',
   DEV_ACCEPTANCE_TESTING: 'DEV_Acceptance Testing',
   STG_ACCEPTANCE_TESTING: 'STG_Acceptance Testing',
+  DEV_APPROVED: 'DEV_Approved',
   APPROVED: 'Approved',
   READY_FOR_RELEASE: 'Ready For Release',
   RELEASED: 'Released',
