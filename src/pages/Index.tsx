@@ -1,26 +1,36 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { AnalysisForm } from "@/components/AnalysisForm";
 import { AnalysisResults } from "@/components/AnalysisResults";
 import { analyzeMetrics } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 import type { AnalysisRequest, AnalysisResult } from "@/types/metrics";
 import { t } from "@/lib/i18n";
-import { AlertCircle, Shield } from "lucide-react";
+import { AlertCircle, Shield, Loader2 } from "lucide-react";
+import { Progress } from "@/components/ui/progress";
 
 const Index = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastRequest, setLastRequest] = useState<Partial<AnalysisRequest>>({});
+  const [progressStep, setProgressStep] = useState<string>("");
+  const [progressPercent, setProgressPercent] = useState<number>(0);
   const { toast } = useToast();
+
+  const handleProgress = useCallback((step: string, progress: number) => {
+    setProgressStep(step);
+    setProgressPercent(progress);
+  }, []);
 
   const handleSubmit = async (request: AnalysisRequest) => {
     setIsLoading(true);
     setError(null);
+    setProgressStep("Инициализация анализа...");
+    setProgressPercent(0);
     setLastRequest(request);
 
     try {
-      const analysisResult = await analyzeMetrics(request);
+      const analysisResult = await analyzeMetrics(request, handleProgress);
       setResult(analysisResult);
       toast({
         title: t('analysisComplete'),
@@ -36,6 +46,8 @@ const Index = () => {
       });
     } finally {
       setIsLoading(false);
+      setProgressStep("");
+      setProgressPercent(0);
     }
   };
 
@@ -96,6 +108,21 @@ const Index = () => {
               initialValues={lastRequest}
             />
 
+            {/* Loading Progress Indicator */}
+            {isLoading && (
+              <div className="max-w-2xl mx-auto p-6 rounded-lg bg-card border border-border animate-fade-in">
+                <div className="flex items-center gap-3 mb-4">
+                  <Loader2 className="h-5 w-5 text-primary animate-spin" />
+                  <span className="font-medium text-foreground">Анализ выполняется...</span>
+                </div>
+                <Progress value={progressPercent} className="h-2 mb-2" />
+                <p className="text-sm text-muted-foreground">{progressStep}</p>
+                <p className="text-xs text-muted-foreground mt-2">
+                  Большие запросы могут занять несколько минут. Пожалуйста, не закрывайте страницу.
+                </p>
+              </div>
+            )}
+
             {error && (
               <div className="max-w-2xl mx-auto p-4 rounded-lg bg-destructive/10 border border-destructive/20 flex items-start gap-3 animate-fade-in">
                 <AlertCircle className="h-5 w-5 text-destructive mt-0.5 flex-shrink-0" />
@@ -107,46 +134,50 @@ const Index = () => {
             )}
 
             {/* Security Info */}
-            <div className="max-w-2xl mx-auto">
-              <div className="p-4 rounded-lg bg-accent/50 border border-border">
-                <h3 className="font-medium text-foreground flex items-center gap-2 mb-2">
-                  <Shield className="h-4 w-4 text-primary" />
-                  {t('securityPrivacy')}
-                </h3>
-                <ul className="text-sm text-muted-foreground space-y-1">
-                  <li>• {t('securityNote1')}</li>
-                  <li>• {t('securityNote2')}</li>
-                  <li>• {t('securityNote3')}</li>
-                  <li>• {t('securityNote4')}</li>
-                </ul>
+            {!isLoading && (
+              <div className="max-w-2xl mx-auto">
+                <div className="p-4 rounded-lg bg-accent/50 border border-border">
+                  <h3 className="font-medium text-foreground flex items-center gap-2 mb-2">
+                    <Shield className="h-4 w-4 text-primary" />
+                    {t('securityPrivacy')}
+                  </h3>
+                  <ul className="text-sm text-muted-foreground space-y-1">
+                    <li>• {t('securityNote1')}</li>
+                    <li>• {t('securityNote2')}</li>
+                    <li>• {t('securityNote3')}</li>
+                    <li>• {t('securityNote4')}</li>
+                  </ul>
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Metrics Info */}
-            <div className="max-w-2xl mx-auto">
-              <div className="p-4 rounded-lg border border-border bg-card">
-                <h3 className="font-medium text-foreground mb-3">{t('metricsCalculated')}</h3>
-                <div className="grid gap-4 md:grid-cols-2 text-sm">
-                  <div>
-                    <p className="font-medium text-foreground">{t('developerMetricsInfo')}</p>
-                    <ul className="text-muted-foreground mt-1 space-y-0.5">
-                      <li>• {t('developmentSpeed')}</li>
-                      <li>• {t('returnCount')}</li>
-                      <li>• {t('returnsBySource')}</li>
-                    </ul>
-                  </div>
-                  <div>
-                    <p className="font-medium text-foreground">{t('testerMetricsInfo')}</p>
-                    <ul className="text-muted-foreground mt-1 space-y-0.5">
-                      <li>• {t('closedItemsCountInfo')}</li>
-                      <li>• {t('testingSpeed')}</li>
-                      <li>• {t('testingIterations')}</li>
-                      <li>• {t('prCommentsAuthored')}</li>
-                    </ul>
+            {!isLoading && (
+              <div className="max-w-2xl mx-auto">
+                <div className="p-4 rounded-lg border border-border bg-card">
+                  <h3 className="font-medium text-foreground mb-3">{t('metricsCalculated')}</h3>
+                  <div className="grid gap-4 md:grid-cols-2 text-sm">
+                    <div>
+                      <p className="font-medium text-foreground">{t('developerMetricsInfo')}</p>
+                      <ul className="text-muted-foreground mt-1 space-y-0.5">
+                        <li>• {t('developmentSpeed')}</li>
+                        <li>• {t('returnCount')}</li>
+                        <li>• {t('returnsBySource')}</li>
+                      </ul>
+                    </div>
+                    <div>
+                      <p className="font-medium text-foreground">{t('testerMetricsInfo')}</p>
+                      <ul className="text-muted-foreground mt-1 space-y-0.5">
+                        <li>• {t('closedItemsCountInfo')}</li>
+                        <li>• {t('testingSpeed')}</li>
+                        <li>• {t('testingIterations')}</li>
+                        <li>• {t('prCommentsAuthored')}</li>
+                      </ul>
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
+            )}
           </div>
         )}
       </main>

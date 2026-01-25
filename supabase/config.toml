@@ -1,1 +1,7 @@
 project_id = "evhtxaqrfumjuggxnupl"
+
+[functions.analyze-devops]
+verify_jwt = false
+
+[functions.job-status]
+verify_jwt = false
