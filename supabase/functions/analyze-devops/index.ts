@@ -1373,25 +1373,26 @@ serve(async (req) => {
         .filter(d => d.avgDevTimeHours > 0)
         .slice(0, 10)
         .map(d => ({ name: d.developer, value: Math.round(d.avgDevTimeHours * 10) / 10 })),
-      testingSpeed: [
-        ...testerMetrics.filter(t => t.avgDevTestTimeHours > 0).slice(0, 5).map(t => ({
-          name: `${t.tester} (DEV)`,
-          value: Math.round(t.avgDevTestTimeHours * 10) / 10,
-          category: 'DEV',
-        })),
-        ...testerMetrics.filter(t => t.avgStgTestTimeHours > 0).slice(0, 5).map(t => ({
-          name: `${t.tester} (STG)`,
-          value: Math.round(t.avgStgTestTimeHours * 10) / 10,
-          category: 'STG',
-        })),
-      ],
+      devTestingSpeed: testerMetrics
+        .filter(t => t.avgDevTestTimeHours > 0)
+        .slice(0, 10)
+        .map(t => ({ name: t.tester, value: Math.round(t.avgDevTestTimeHours * 10) / 10 })),
+      stgTestingSpeed: testerMetrics
+        .filter(t => t.avgStgTestTimeHours > 0)
+        .slice(0, 10)
+        .map(t => ({ name: t.tester, value: Math.round(t.avgStgTestTimeHours * 10) / 10 })),
       returns: developerMetrics
         .filter(d => d.totalReturnCount > 0)
         .slice(0, 10)
         .map(d => ({ name: d.developer, value: d.totalReturnCount })),
-      iterations: testerMetrics
+      devIterations: testerMetrics
+        .filter(t => t.devTestingIterations > 0)
         .slice(0, 10)
-        .map(t => ({ name: t.tester, value: t.devTestingIterations + t.stgTestingIterations })),
+        .map(t => ({ name: t.tester, value: t.devTestingIterations })),
+      stgIterations: testerMetrics
+        .filter(t => t.stgTestingIterations > 0)
+        .slice(0, 10)
+        .map(t => ({ name: t.tester, value: t.stgTestingIterations })),
       prComments: prCommentAuthors
         .slice(0, 10)
         .map(p => ({ name: p.author, value: p.count, isTester: p.isTester })),
