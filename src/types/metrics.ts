@@ -5,6 +5,17 @@ export interface AnalysisRequest {
   project: string;
   queryId: string;
   pat: string;
+  debug?: boolean; // Enable structured debug logging
+}
+
+// Enhanced PR reference with authors array
+export interface PRReferenceEnhanced {
+  workItemId: number;
+  workItemTitle: string;
+  prId: string;
+  prUrl: string;
+  commentsCount: number;
+  authors: string[];
 }
 
 // Drill-down work item reference
@@ -18,13 +29,14 @@ export interface WorkItemReference {
   assignedToHistory: string[];
 }
 
-// PR reference for drill-down
+// PR reference for drill-down (enhanced with authors array)
 export interface PRReference {
   prId: string;
   prUrl: string;
   workItemId: number;
   workItemTitle: string;
   commentsCount: number;
+  authors: string[]; // All comment authors on this PR
 }
 
 export interface DeveloperMetrics {

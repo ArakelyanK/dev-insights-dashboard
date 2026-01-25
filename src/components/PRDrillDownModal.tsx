@@ -2,7 +2,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { ExternalLink, X, GitPullRequest } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ExternalLink, X, GitPullRequest, Users } from "lucide-react";
 import type { PRReference } from "@/types/metrics";
 import { t } from "@/lib/i18n";
 
@@ -96,6 +97,7 @@ export function PRDrillDownModal({
                       <tr>
                         <th className="w-32">{t('prId')}</th>
                         <th className="w-32 text-center">{t('commentsCount')}</th>
+                        <th className="w-40">{t('authors')}</th>
                         <th className="w-16"></th>
                       </tr>
                     </thead>
@@ -105,6 +107,30 @@ export function PRDrillDownModal({
                           <td className="font-mono text-sm">PR #{pr.prId}</td>
                           <td className="text-center">
                             <Badge variant="secondary">{pr.commentsCount}</Badge>
+                          </td>
+                          <td>
+                            {pr.authors && pr.authors.length > 0 ? (
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <div className="flex items-center gap-1 cursor-help text-sm text-muted-foreground">
+                                      <Users className="h-3 w-3" />
+                                      <span>{pr.authors.length}</span>
+                                    </div>
+                                  </TooltipTrigger>
+                                  <TooltipContent className="max-w-xs">
+                                    <p className="font-medium mb-1">{t('authors')}:</p>
+                                    <ul className="text-sm space-y-0.5">
+                                      {pr.authors.map((author, idx) => (
+                                        <li key={idx}>{author}</li>
+                                      ))}
+                                    </ul>
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                            ) : (
+                              <span className="text-muted-foreground">—</span>
+                            )}
                           </td>
                           <td>
                             <Button

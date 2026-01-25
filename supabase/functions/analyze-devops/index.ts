@@ -1,6 +1,6 @@
 // deno-lint-ignore-file no-explicit-any
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -14,6 +14,7 @@ interface AnalysisRequest {
   project: string;
   queryId: string;
   pat: string;
+  debug?: boolean;
 }
 
 async function azureRequest(url: string, pat: string): Promise<unknown> {
@@ -50,13 +51,13 @@ serve(async (req) => {
   }
 
   try {
-    const { organization, project, queryId, pat } = await req.json() as AnalysisRequest;
+    const { organization, project, queryId, pat, debug = false } = await req.json() as AnalysisRequest;
 
     if (!organization || !project || !queryId || !pat) {
       throw new Error('Missing required fields: organization, project, queryId, pat');
     }
 
-    console.log(`[Job Init] Starting analysis for ${organization}/${project}`);
+    console.log(`[Job Init] Starting analysis for ${organization}/${project}${debug ? ' (DEBUG MODE)' : ''}`);
 
     // Fetch work item IDs from Azure DevOps
     const workItemIds = await executeQuery(organization, project, queryId, pat);
@@ -108,7 +109,7 @@ serve(async (req) => {
 
     // Use EdgeRuntime.waitUntil to process in background
     // @ts-ignore - EdgeRuntime is available in Supabase Edge Functions
-    EdgeRuntime.waitUntil(processJob(supabase, jobId, organization, project, pat, workItemIds));
+    EdgeRuntime.waitUntil(processJob(supabase, jobId, organization, project, pat, workItemIds, debug));
 
     return new Response(JSON.stringify({
       jobId,
@@ -133,8 +134,11 @@ async function processJob(
   organization: string,
   project: string,
   pat: string,
-  workItemIds: number[]
+  workItemIds: number[],
+  debug: boolean
 ) {
+  const debugLogs: Record<number, any> = {};
+
   try {
     console.log(`[Job ${jobId}] Starting background processing`);
 
@@ -152,7 +156,7 @@ async function processJob(
       await updateJobStatus(supabase, jobId, `Processing chunk ${i + 1}/${chunks.length}`, Math.round(((i + 1) / chunks.length) * 50));
       
       console.log(`[Job ${jobId}] Processing chunk ${i + 1}/${chunks.length} (${chunk.length} items)`);
-      const chunkResult = await processWorkItemChunk(organization, project, pat, chunk);
+      const chunkResult = await processWorkItemChunk(organization, project, pat, chunk, debug, debugLogs);
       allChunkResults.push(chunkResult);
 
       // Save chunk result to database for recovery
@@ -173,6 +177,12 @@ async function processJob(
     // Step 4: Merge all results
     await updateJobStatus(supabase, jobId, 'Merging results...', 90);
     const finalResult = mergeChunkResults(allChunkResults, prResults, workItems);
+    
+    // Add debug logs if enabled
+    if (debug) {
+      (finalResult as any).debugLogs = debugLogs;
+    }
+    
     console.log(`[Job ${jobId}] Merged ${allChunkResults.length} chunks`);
 
     // Step 5: Save final result
@@ -289,6 +299,7 @@ interface PRReference {
   workItemId: number;
   workItemTitle: string;
   commentsCount: number;
+  authors: string[]; // Enhanced: array of comment authors
 }
 
 interface ChunkResult {
@@ -353,6 +364,7 @@ function extractAssignedToHistory(revisions: WorkItemRevision[]): string[] {
   return history;
 }
 
+// Developer attribution: current AssignedTo -> fallback to last known -> Unassigned
 function getCurrentAssignedTo(wi: WorkItem, history: string[]): string {
   const current = getDisplayName(wi.fields['System.AssignedTo']);
   if (current) return current;
@@ -501,13 +513,64 @@ function calculateTestingMetrics(
   return metrics;
 }
 
+// ============== Debug Logging ==============
+
+interface DebugLog {
+  workItemId: number;
+  title: string;
+  currentAssignedTo: string;
+  assignedToHistory: string[];
+  transitions: Array<{
+    from: string;
+    to: string;
+    timestamp: string;
+    changedBy: string | null;
+    assignedTo: string | null;
+  }>;
+  devTime: { hours: number; cycles: number };
+  returns: { cr: number; dev: number; stg: number };
+  devTesting: Array<{ tester: string; hours: number; cycles: number; iterations: number }>;
+  stgTesting: Array<{ tester: string; hours: number; cycles: number; iterations: number }>;
+}
+
+function createDebugLog(
+  wi: WorkItem,
+  assignedTo: string,
+  history: string[],
+  transitions: TransitionEvent[],
+  devTime: { totalHours: number; cycles: number },
+  returns: { cr: number; dev: number; stg: number },
+  devTest: Map<string, { hours: number; cycles: number; iterations: number }>,
+  stgTest: Map<string, { hours: number; cycles: number; iterations: number }>
+): DebugLog {
+  return {
+    workItemId: wi.id,
+    title: wi.fields['System.Title'] as string,
+    currentAssignedTo: assignedTo,
+    assignedToHistory: history,
+    transitions: transitions.map(t => ({
+      from: t.fromState,
+      to: t.toState,
+      timestamp: t.timestamp.toISOString(),
+      changedBy: t.changedBy,
+      assignedTo: t.assignedTo,
+    })),
+    devTime: { hours: devTime.totalHours, cycles: devTime.cycles },
+    returns,
+    devTesting: Array.from(devTest.entries()).map(([tester, data]) => ({ tester, ...data })),
+    stgTesting: Array.from(stgTest.entries()).map(([tester, data]) => ({ tester, ...data })),
+  };
+}
+
 // ============== Chunk Processing ==============
 
 async function processWorkItemChunk(
   org: string,
   project: string,
   pat: string,
-  workItems: WorkItem[]
+  workItems: WorkItem[],
+  debug: boolean,
+  debugLogs: Record<number, any>
 ): Promise<ChunkResult> {
   const devAgg: Record<string, DevAggData> = {};
   const testerAgg: Record<string, TesterAggData> = {};
@@ -542,6 +605,8 @@ async function processWorkItemChunk(
       const title = wi.fields['System.Title'] as string;
       const state = wi.fields['System.State'] as string;
       const history = extractAssignedToHistory(revisions);
+      
+      // Developer attribution: strictly by current AssignedTo with fallbacks
       const assignedTo = getCurrentAssignedTo(wi, history);
       const url = `https://dev.azure.com/${org}/${project}/_workitems/edit/${wi.id}`;
 
@@ -566,7 +631,7 @@ async function processWorkItemChunk(
 
       if (assignedTo === 'Unassigned') unassignedItems.push({ ...ref, count: 1 });
 
-      // Returns
+      // Returns - attributed to current assignedTo (not at transition time)
       const returns = countReturns(transitions);
       da.cr += returns.cr;
       da.dev += returns.dev;
@@ -625,6 +690,11 @@ async function processWorkItemChunk(
           ta.closed.push({ ...ref, count: 1 });
         }
       }
+
+      // Debug logging (only when enabled)
+      if (debug) {
+        debugLogs[wi.id] = createDebugLog(wi, assignedTo, history, transitions, devTime, returns, devTest, stgTest);
+      }
     }
   }
 
@@ -682,18 +752,28 @@ async function getPRCommentsForItem(
       const threads = await azureRequest2(url, pat) as { value: Array<{ comments: Array<{ author: { displayName: string }; commentType: string }> }> };
 
       const prUrl = `https://dev.azure.com/${org}/${project}/_git/${repoId}/pullrequest/${prId}`;
+      
+      // Collect all authors for this PR
+      const prAuthors: Set<string> = new Set();
 
       for (const thread of threads.value) {
         if (thread.comments?.[0]?.commentType === 'text') {
           const author = thread.comments[0].author.displayName;
+          prAuthors.add(author);
 
           if (!result.has(author)) result.set(author, { count: 0, prs: [] });
           const data = result.get(author)!;
           data.count++;
 
           const existing = data.prs.find(p => p.prId === prId);
-          if (existing) existing.commentsCount++;
-          else data.prs.push({ prId, prUrl, workItemId: workItem.id, workItemTitle: title, commentsCount: 1 });
+          if (existing) {
+            existing.commentsCount++;
+            if (!existing.authors.includes(author)) {
+              existing.authors.push(author);
+            }
+          } else {
+            data.prs.push({ prId, prUrl, workItemId: workItem.id, workItemTitle: title, commentsCount: 1, authors: [author] });
+          }
         }
       }
     } catch {
