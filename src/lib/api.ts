@@ -21,7 +21,7 @@ interface JobStatusResponse {
 }
 
 const POLL_INTERVAL = 2000; // 2 seconds
-const MAX_POLL_TIME = 600000; // 10 minutes max
+const MAX_POLL_TIME = 1800000; // 30 minutes max - never timeout while job is running
 
 /**
  * Calls the backend edge function to analyze Azure DevOps metrics.
