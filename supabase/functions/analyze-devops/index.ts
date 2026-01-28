@@ -7,7 +7,9 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-const CHUNK_SIZE = 50; // Work items per chunk - optimized for CPU limits
+const CHUNK_SIZE = 50; // Work items per chunk
+const CHUNK_CONCURRENCY = 4; // Parallel chunk processing limit
+const DEBUG_THRESHOLD = 20; // Auto-enable debug for <= 20 items
 
 interface AnalysisRequest {
   organization: string;
@@ -51,17 +53,19 @@ serve(async (req) => {
   }
 
   try {
-    const { organization, project, queryId, pat, debug = false } = await req.json() as AnalysisRequest;
+    const { organization, project, queryId, pat, debug: requestDebug = false } = await req.json() as AnalysisRequest;
 
     if (!organization || !project || !queryId || !pat) {
       throw new Error('Missing required fields: organization, project, queryId, pat');
     }
 
-    console.log(`[Job Init] Starting analysis for ${organization}/${project}${debug ? ' (DEBUG MODE)' : ''}`);
-
     // Fetch work item IDs from Azure DevOps
     const workItemIds = await executeQuery(organization, project, queryId, pat);
-    console.log(`[Job Init] Found ${workItemIds.length} work items`);
+    
+    // Deterministic DEBUG mode: auto-enable for small queries
+    const debug = requestDebug || workItemIds.length <= DEBUG_THRESHOLD;
+    
+    console.log(`[Job Init] Starting analysis for ${organization}/${project} (${workItemIds.length} items)${debug ? ' [DEBUG MODE]' : ''}`);
 
     // Handle empty query result
     if (workItemIds.length === 0) {
@@ -116,6 +120,7 @@ serve(async (req) => {
       status: 'processing',
       totalItems: workItemIds.length,
       totalChunks,
+      debugEnabled: debug,
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   } catch (error) {
@@ -137,55 +142,69 @@ async function processJob(
   workItemIds: number[],
   debug: boolean
 ) {
-  const debugLogs: Record<number, any> = {};
+  const debugLogs: DebugOutput = { workItems: {}, prComments: [] };
 
   try {
-    console.log(`[Job ${jobId}] Starting background processing`);
+    console.log(`[Job ${jobId}] Starting background processing${debug ? ' [DEBUG]' : ''}`);
 
     // Step 1: Fetch all work items with relations (batched)
     await updateJobStatus(supabase, jobId, 'Fetching work items...');
     const workItems = await fetchWorkItemsBatched(organization, project, workItemIds, pat);
     console.log(`[Job ${jobId}] Fetched ${workItems.length} work items`);
 
-    // Step 2: Process work items in chunks
+    // Step 2: Process work items in chunks with parallel concurrency
     const chunks = chunkArray(workItems, CHUNK_SIZE);
     const allChunkResults: ChunkResult[] = [];
+    let processedChunks = 0;
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      await updateJobStatus(supabase, jobId, `Processing chunk ${i + 1}/${chunks.length}`, Math.round(((i + 1) / chunks.length) * 50));
+    // Process chunks in parallel batches with concurrency limit
+    for (let i = 0; i < chunks.length; i += CHUNK_CONCURRENCY) {
+      const chunkBatch = chunks.slice(i, Math.min(i + CHUNK_CONCURRENCY, chunks.length));
       
-      console.log(`[Job ${jobId}] Processing chunk ${i + 1}/${chunks.length} (${chunk.length} items)`);
-      const chunkResult = await processWorkItemChunk(organization, project, pat, chunk, debug, debugLogs);
-      allChunkResults.push(chunkResult);
+      await updateJobStatus(
+        supabase, 
+        jobId, 
+        `Processing chunks ${i + 1}-${Math.min(i + CHUNK_CONCURRENCY, chunks.length)}/${chunks.length}`,
+        Math.round((processedChunks / chunks.length) * 70)
+      );
+      
+      console.log(`[Job ${jobId}] Processing chunks ${i + 1} to ${Math.min(i + CHUNK_CONCURRENCY, chunks.length)}/${chunks.length}`);
 
-      // Save chunk result to database for recovery
-      const chunkData = {
-        job_id: jobId,
-        chunk_index: i,
-        chunk_type: 'work_items',
-        data: chunkResult,
-      };
-      await (supabase.from('analysis_chunks') as any).insert(chunkData);
+      // Process chunk batch in parallel - including PR comments per chunk
+      const batchResults = await Promise.all(
+        chunkBatch.map((chunk, idx) => 
+          processWorkItemChunkWithPRs(organization, project, pat, chunk, debug, debugLogs, jobId, i + idx)
+        )
+      );
+
+      allChunkResults.push(...batchResults);
+      processedChunks += chunkBatch.length;
+
+      // Save chunk results to database for recovery
+      for (let j = 0; j < batchResults.length; j++) {
+        const chunkData = {
+          job_id: jobId,
+          chunk_index: i + j,
+          chunk_type: 'work_items_with_prs',
+          data: batchResults[j],
+        };
+        await (supabase.from('analysis_chunks') as any).insert(chunkData);
+      }
     }
 
-    // Step 3: Process PR comments for ALL work items
-    await updateJobStatus(supabase, jobId, 'Processing PR comments...', 60);
-    const prResults = await processPRCommentsBatched(organization, project, pat, workItems);
-    console.log(`[Job ${jobId}] PR comments processed`);
-
-    // Step 4: Merge all results
+    // Step 3: Merge all results (numeric summation only)
     await updateJobStatus(supabase, jobId, 'Merging results...', 90);
-    const finalResult = mergeChunkResults(allChunkResults, prResults, workItems);
+    const finalResult = mergeChunkResultsNumeric(allChunkResults, workItems);
     
     // Add debug logs if enabled
     if (debug) {
       (finalResult as any).debugLogs = debugLogs;
+      console.log(`[Job ${jobId}] Debug logs: ${Object.keys(debugLogs.workItems).length} work items, ${debugLogs.prComments.length} PR comments`);
     }
     
     console.log(`[Job ${jobId}] Merged ${allChunkResults.length} chunks`);
 
-    // Step 5: Save final result
+    // Step 4: Save final result
     const completedUpdate = {
       status: 'completed',
       processed_items: workItemIds.length,
@@ -299,12 +318,13 @@ interface PRReference {
   workItemId: number;
   workItemTitle: string;
   commentsCount: number;
-  authors: string[]; // Enhanced: array of comment authors
+  authors: string[];
 }
 
 interface ChunkResult {
   devAgg: Record<string, DevAggData>;
   testerAgg: Record<string, TesterAggData>;
+  prAgg: Record<string, { count: number; prs: PRReference[] }>;
   testers: string[];
   unassignedItems: WorkItemReference[];
   totalDevHours: number;
@@ -341,6 +361,59 @@ interface TesterAggData {
   stgItems: WorkItemReference[];
   prDetails: PRReference[];
   prsReviewed: number;
+}
+
+// ============== Debug Logging Structures ==============
+
+interface DebugOutput {
+  workItems: Record<number, WorkItemDebugLog>;
+  prComments: PRCommentDebugLog[];
+}
+
+interface WorkItemDebugLog {
+  workItemId: number;
+  title: string;
+  currentAssignedTo: string;
+  assignedToHistory: string[];
+  activePeriods: Array<{
+    start: string;
+    end: string | null;
+    durationHours: number;
+  }>;
+  devTestingCycles: Array<{
+    tester: string;
+    periods: Array<{ start: string; end: string; durationHours: number }>;
+    merged: boolean;
+    closingStatus: string;
+  }>;
+  stgTestingCycles: Array<{
+    tester: string;
+    periods: Array<{ start: string; end: string; durationHours: number }>;
+    merged: boolean;
+    closingStatus: string;
+  }>;
+  fixRequiredReturns: Array<{
+    sourceState: string;
+    timestamp: string;
+    changedBy: string | null;
+  }>;
+  transitions: Array<{
+    from: string;
+    to: string;
+    timestamp: string;
+    changedBy: string | null;
+    assignedTo: string | null;
+  }>;
+}
+
+interface PRCommentDebugLog {
+  workItemId: number;
+  prId: string;
+  prUrl: string;
+  commentId: string;
+  author: string;
+  counted: boolean;
+  reason: string;
 }
 
 function getDisplayName(field: unknown): string | null {
@@ -391,50 +464,88 @@ function extractTransitions(revisions: WorkItemRevision[], workItemId: number): 
   return transitions;
 }
 
-function calculateDevelopmentTime(transitions: TransitionEvent[]): { totalHours: number; cycles: number } {
+interface ActivePeriod {
+  start: Date;
+  end: Date | null;
+  durationHours: number;
+}
+
+function calculateDevelopmentTime(transitions: TransitionEvent[]): { totalHours: number; cycles: number; activePeriods: ActivePeriod[] } {
   let totalHours = 0;
   let cycles = 0;
   let activeStart: Date | null = null;
+  const activePeriods: ActivePeriod[] = [];
 
   for (const t of transitions) {
     if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
       if (activeStart) {
-        totalHours += (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
+        const duration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
+        totalHours += duration;
         cycles++;
+        activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration });
         activeStart = null;
       }
-      return { totalHours, cycles };
+      return { totalHours, cycles, activePeriods };
     }
     if (t.toState === STATES.ACTIVE) {
       activeStart = t.timestamp;
     } else if (t.fromState === STATES.ACTIVE && activeStart) {
-      totalHours += (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
+      const duration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
+      totalHours += duration;
       cycles++;
+      activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration });
       activeStart = null;
     }
   }
-  return { totalHours, cycles };
+  
+  // Handle case where still in Active state
+  if (activeStart) {
+    activePeriods.push({ start: activeStart, end: null, durationHours: 0 });
+  }
+  
+  return { totalHours, cycles, activePeriods };
 }
 
-function countReturns(transitions: TransitionEvent[]): { cr: number; dev: number; stg: number } {
+interface FixRequiredReturn {
+  sourceState: string;
+  timestamp: Date;
+  changedBy: string | null;
+}
+
+function countReturns(transitions: TransitionEvent[]): { cr: number; dev: number; stg: number; returns: FixRequiredReturn[] } {
   let cr = 0, dev = 0, stg = 0;
+  const returns: FixRequiredReturn[] = [];
+  
   for (const t of transitions) {
     if (t.toState === STATES.FIX_REQUIRED) {
+      returns.push({
+        sourceState: t.fromState,
+        timestamp: t.timestamp,
+        changedBy: t.changedBy,
+      });
       if (t.fromState === STATES.CODE_REVIEW) cr++;
       else if (t.fromState === STATES.DEV_IN_TESTING || t.fromState === STATES.DEV_ACCEPTANCE_TESTING) dev++;
       else if (t.fromState === STATES.STG_IN_TESTING || t.fromState === STATES.STG_ACCEPTANCE_TESTING) stg++;
     }
   }
-  return { cr, dev, stg };
+  return { cr, dev, stg, returns };
 }
 
-function calculateTestingMetrics(
+interface TestingCycleDetail {
+  tester: string;
+  periods: Array<{ start: Date; end: Date; durationHours: number }>;
+  merged: boolean;
+  closingStatus: string;
+}
+
+function calculateTestingMetricsWithDetails(
   transitions: TransitionEvent[],
   inTestingState: string,
   acceptanceState: string
-): Map<string, { hours: number; cycles: number; iterations: number }> {
+): { metrics: Map<string, { hours: number; cycles: number; iterations: number }>; cycles: TestingCycleDetail[] } {
   const metrics = new Map<string, { hours: number; cycles: number; iterations: number }>();
-  let cycle: { tester: string; start: Date; periods: number[]; pendingMerge: boolean } | null = null;
+  const cycles: TestingCycleDetail[] = [];
+  let cycle: { tester: string; start: Date; periods: Array<{ start: Date; end: Date; durationHours: number }>; pendingMerge: boolean; lastState: string } | null = null;
 
   for (let i = 0; i < transitions.length; i++) {
     const t = transitions[i];
@@ -446,18 +557,20 @@ function calculateTestingMetrics(
         cycle.pendingMerge = false;
       } else {
         if (cycle) {
-          const hours = cycle.periods.reduce((a, b) => a + b, 0);
+          const hours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
           if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
           const m = metrics.get(cycle.tester)!;
           m.hours += hours;
           m.cycles++;
           m.iterations++;
+          cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: cycle.pendingMerge, closingStatus: cycle.lastState });
         }
-        cycle = { tester, start: t.timestamp, periods: [], pendingMerge: false };
+        cycle = { tester, start: t.timestamp, periods: [], pendingMerge: false, lastState: inTestingState };
       }
     } else if (t.fromState === inTestingState && cycle) {
-      const hours = (t.timestamp.getTime() - cycle.start.getTime()) / 3600000;
-      cycle.periods.push(hours);
+      const durationHours = (t.timestamp.getTime() - cycle.start.getTime()) / 3600000;
+      cycle.periods.push({ start: cycle.start, end: t.timestamp, durationHours });
+      cycle.lastState = t.toState;
 
       if (t.toState === acceptanceState) {
         let canMerge = false;
@@ -474,106 +587,64 @@ function calculateTestingMetrics(
           cycle.pendingMerge = true;
           cycle.start = t.timestamp;
         } else {
-          const totalHours = cycle.periods.reduce((a, b) => a + b, 0);
+          const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
           if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
           const m = metrics.get(cycle.tester)!;
           m.hours += totalHours;
           m.cycles++;
           m.iterations++;
+          cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: false, closingStatus: t.toState });
           cycle = null;
         }
       } else {
-        const totalHours = cycle.periods.reduce((a, b) => a + b, 0);
+        const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
         if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
         const m = metrics.get(cycle.tester)!;
         m.hours += totalHours;
         m.cycles++;
         m.iterations++;
+        cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: false, closingStatus: t.toState });
         cycle = null;
       }
     } else if (cycle?.pendingMerge && t.fromState === acceptanceState && t.toState !== inTestingState) {
-      const totalHours = cycle.periods.reduce((a, b) => a + b, 0);
+      const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
       if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
       const m = metrics.get(cycle.tester)!;
       m.hours += totalHours;
       m.cycles++;
       m.iterations++;
+      cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: true, closingStatus: t.toState });
       cycle = null;
     }
   }
 
   if (cycle) {
-    const totalHours = cycle.periods.reduce((a, b) => a + b, 0);
+    const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
     if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
     const m = metrics.get(cycle.tester)!;
     m.hours += totalHours;
     m.cycles++;
+    cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: cycle.pendingMerge, closingStatus: 'In Progress' });
   }
 
-  return metrics;
+  return { metrics, cycles };
 }
 
-// ============== Debug Logging ==============
+// ============== Chunk Processing with PR Comments ==============
 
-interface DebugLog {
-  workItemId: number;
-  title: string;
-  currentAssignedTo: string;
-  assignedToHistory: string[];
-  transitions: Array<{
-    from: string;
-    to: string;
-    timestamp: string;
-    changedBy: string | null;
-    assignedTo: string | null;
-  }>;
-  devTime: { hours: number; cycles: number };
-  returns: { cr: number; dev: number; stg: number };
-  devTesting: Array<{ tester: string; hours: number; cycles: number; iterations: number }>;
-  stgTesting: Array<{ tester: string; hours: number; cycles: number; iterations: number }>;
-}
-
-function createDebugLog(
-  wi: WorkItem,
-  assignedTo: string,
-  history: string[],
-  transitions: TransitionEvent[],
-  devTime: { totalHours: number; cycles: number },
-  returns: { cr: number; dev: number; stg: number },
-  devTest: Map<string, { hours: number; cycles: number; iterations: number }>,
-  stgTest: Map<string, { hours: number; cycles: number; iterations: number }>
-): DebugLog {
-  return {
-    workItemId: wi.id,
-    title: wi.fields['System.Title'] as string,
-    currentAssignedTo: assignedTo,
-    assignedToHistory: history,
-    transitions: transitions.map(t => ({
-      from: t.fromState,
-      to: t.toState,
-      timestamp: t.timestamp.toISOString(),
-      changedBy: t.changedBy,
-      assignedTo: t.assignedTo,
-    })),
-    devTime: { hours: devTime.totalHours, cycles: devTime.cycles },
-    returns,
-    devTesting: Array.from(devTest.entries()).map(([tester, data]) => ({ tester, ...data })),
-    stgTesting: Array.from(stgTest.entries()).map(([tester, data]) => ({ tester, ...data })),
-  };
-}
-
-// ============== Chunk Processing ==============
-
-async function processWorkItemChunk(
+async function processWorkItemChunkWithPRs(
   org: string,
   project: string,
   pat: string,
   workItems: WorkItem[],
   debug: boolean,
-  debugLogs: Record<number, any>
+  debugLogs: DebugOutput,
+  jobId: string,
+  chunkIndex: number
 ): Promise<ChunkResult> {
   const devAgg: Record<string, DevAggData> = {};
   const testerAgg: Record<string, TesterAggData> = {};
+  const prAgg: Record<string, { count: number; prs: PRReference[] }> = {};
   const testers: string[] = [];
   const unassignedItems: WorkItemReference[] = [];
   let totalDevHours = 0, totalDevTestHours = 0, totalStgTestHours = 0;
@@ -632,22 +703,22 @@ async function processWorkItemChunk(
       if (assignedTo === 'Unassigned') unassignedItems.push({ ...ref, count: 1 });
 
       // Returns - attributed to current assignedTo (not at transition time)
-      const returns = countReturns(transitions);
-      da.cr += returns.cr;
-      da.dev += returns.dev;
-      da.stg += returns.stg;
+      const returnsData = countReturns(transitions);
+      da.cr += returnsData.cr;
+      da.dev += returnsData.dev;
+      da.stg += returnsData.stg;
 
-      const totalRet = returns.cr + returns.dev + returns.stg;
+      const totalRet = returnsData.cr + returnsData.dev + returnsData.stg;
       if (totalRet > 0) da.returns.push({ ...ref, count: totalRet });
-      if (returns.cr > 0) da.crReturns.push({ ...ref, count: returns.cr });
-      if (returns.dev > 0) da.devReturns.push({ ...ref, count: returns.dev });
-      if (returns.stg > 0) da.stgReturns.push({ ...ref, count: returns.stg });
+      if (returnsData.cr > 0) da.crReturns.push({ ...ref, count: returnsData.cr });
+      if (returnsData.dev > 0) da.devReturns.push({ ...ref, count: returnsData.dev });
+      if (returnsData.stg > 0) da.stgReturns.push({ ...ref, count: returnsData.stg });
 
       if (state === STATES.RELEASED) da.completed++;
 
-      // DEV Testing
-      const devTest = calculateTestingMetrics(transitions, STATES.DEV_IN_TESTING, STATES.DEV_ACCEPTANCE_TESTING);
-      for (const [tester, data] of devTest) {
+      // DEV Testing with details for debug
+      const devTestResult = calculateTestingMetricsWithDetails(transitions, STATES.DEV_IN_TESTING, STATES.DEV_ACCEPTANCE_TESTING);
+      for (const [tester, data] of devTestResult.metrics) {
         if (!testerAgg[tester]) {
           testerAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
         }
@@ -668,9 +739,9 @@ async function processWorkItemChunk(
         }
       }
 
-      // STG Testing
-      const stgTest = calculateTestingMetrics(transitions, STATES.STG_IN_TESTING, STATES.STG_ACCEPTANCE_TESTING);
-      for (const [tester, data] of stgTest) {
+      // STG Testing with details for debug
+      const stgTestResult = calculateTestingMetricsWithDetails(transitions, STATES.STG_IN_TESTING, STATES.STG_ACCEPTANCE_TESTING);
+      for (const [tester, data] of stgTestResult.metrics) {
         if (!testerAgg[tester]) {
           testerAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
         }
@@ -691,37 +762,89 @@ async function processWorkItemChunk(
         }
       }
 
-      // Debug logging (only when enabled)
+      // Debug logging per work item
       if (debug) {
-        debugLogs[wi.id] = createDebugLog(wi, assignedTo, history, transitions, devTime, returns, devTest, stgTest);
+        debugLogs.workItems[wi.id] = {
+          workItemId: wi.id,
+          title,
+          currentAssignedTo: assignedTo,
+          assignedToHistory: history,
+          activePeriods: devTime.activePeriods.map(p => ({
+            start: p.start.toISOString(),
+            end: p.end?.toISOString() || null,
+            durationHours: Math.round(p.durationHours * 100) / 100,
+          })),
+          devTestingCycles: devTestResult.cycles.map(c => ({
+            tester: c.tester,
+            periods: c.periods.map(p => ({
+              start: p.start.toISOString(),
+              end: p.end.toISOString(),
+              durationHours: Math.round(p.durationHours * 100) / 100,
+            })),
+            merged: c.merged,
+            closingStatus: c.closingStatus,
+          })),
+          stgTestingCycles: stgTestResult.cycles.map(c => ({
+            tester: c.tester,
+            periods: c.periods.map(p => ({
+              start: p.start.toISOString(),
+              end: p.end.toISOString(),
+              durationHours: Math.round(p.durationHours * 100) / 100,
+            })),
+            merged: c.merged,
+            closingStatus: c.closingStatus,
+          })),
+          fixRequiredReturns: returnsData.returns.map(r => ({
+            sourceState: r.sourceState,
+            timestamp: r.timestamp.toISOString(),
+            changedBy: r.changedBy,
+          })),
+          transitions: transitions.map(t => ({
+            from: t.fromState,
+            to: t.toState,
+            timestamp: t.timestamp.toISOString(),
+            changedBy: t.changedBy,
+            assignedTo: t.assignedTo,
+          })),
+        };
       }
     }
   }
 
-  return { devAgg, testerAgg, testers, unassignedItems, totalDevHours, totalDevTestHours, totalStgTestHours, requirements, bugs, tasks };
+  // Process PR comments for this chunk's work items
+  const prResult = await processPRCommentsForChunk(org, project, pat, workItems, debug, debugLogs, jobId);
+  for (const [author, data] of Object.entries(prResult)) {
+    if (!prAgg[author]) prAgg[author] = { count: 0, prs: [] };
+    prAgg[author].count += data.count;
+    prAgg[author].prs.push(...data.prs);
+  }
+
+  return { devAgg, testerAgg, prAgg, testers, unassignedItems, totalDevHours, totalDevTestHours, totalStgTestHours, requirements, bugs, tasks };
 }
 
-// ============== PR Comments Processing ==============
+// ============== PR Comments Processing Per Chunk ==============
 
-async function processPRCommentsBatched(
+async function processPRCommentsForChunk(
   org: string,
   project: string,
   pat: string,
-  workItems: WorkItem[]
-): Promise<Map<string, { count: number; prs: PRReference[] }>> {
-  const prAgg = new Map<string, { count: number; prs: PRReference[] }>();
+  workItems: WorkItem[],
+  debug: boolean,
+  debugLogs: DebugOutput,
+  jobId: string
+): Promise<Record<string, { count: number; prs: PRReference[] }>> {
+  const prAgg: Record<string, { count: number; prs: PRReference[] }> = {};
   const PR_BATCH_SIZE = 15;
 
   for (let i = 0; i < workItems.length; i += PR_BATCH_SIZE) {
     const batch = workItems.slice(i, i + PR_BATCH_SIZE);
-    const results = await Promise.all(batch.map(wi => getPRCommentsForItem(org, project, wi, pat)));
+    const results = await Promise.all(batch.map(wi => getPRCommentsForItem(org, project, wi, pat, debug, debugLogs)));
 
     for (const result of results) {
-      for (const [author, data] of result) {
-        if (!prAgg.has(author)) prAgg.set(author, { count: 0, prs: [] });
-        const pa = prAgg.get(author)!;
-        pa.count += data.count;
-        pa.prs.push(...data.prs);
+      for (const [author, data] of Object.entries(result)) {
+        if (!prAgg[author]) prAgg[author] = { count: 0, prs: [] };
+        prAgg[author].count += data.count;
+        prAgg[author].prs.push(...data.prs);
       }
     }
   }
@@ -733,14 +856,18 @@ async function getPRCommentsForItem(
   org: string,
   project: string,
   workItem: WorkItem,
-  pat: string
-): Promise<Map<string, { count: number; prs: PRReference[] }>> {
-  const result = new Map<string, { count: number; prs: PRReference[] }>();
+  pat: string,
+  debug: boolean,
+  debugLogs: DebugOutput
+): Promise<Record<string, { count: number; prs: PRReference[] }>> {
+  const result: Record<string, { count: number; prs: PRReference[] }> = {};
 
   if (!workItem.relations) return result;
 
   const prLinks = workItem.relations.filter(r => r.rel === 'ArtifactLink' && r.url.includes('PullRequestId'));
   const title = workItem.fields['System.Title'] as string;
+
+  let commentIndex = 0;
 
   for (const link of prLinks) {
     try {
@@ -749,7 +876,7 @@ async function getPRCommentsForItem(
 
       const [, repoId, prId] = match;
       const url = `https://dev.azure.com/${org}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=7.1`;
-      const threads = await azureRequest2(url, pat) as { value: Array<{ comments: Array<{ author: { displayName: string }; commentType: string }> }> };
+      const threads = await azureRequest2(url, pat) as { value: Array<{ id: number; comments: Array<{ id: number; author: { displayName: string }; commentType: string }> }> };
 
       const prUrl = `https://dev.azure.com/${org}/${project}/_git/${repoId}/pullrequest/${prId}`;
       
@@ -757,23 +884,41 @@ async function getPRCommentsForItem(
       const prAuthors: Set<string> = new Set();
 
       for (const thread of threads.value) {
-        if (thread.comments?.[0]?.commentType === 'text') {
-          const author = thread.comments[0].author.displayName;
-          prAuthors.add(author);
-
-          if (!result.has(author)) result.set(author, { count: 0, prs: [] });
-          const data = result.get(author)!;
-          data.count++;
-
-          const existing = data.prs.find(p => p.prId === prId);
-          if (existing) {
-            existing.commentsCount++;
-            if (!existing.authors.includes(author)) {
-              existing.authors.push(author);
-            }
-          } else {
-            data.prs.push({ prId, prUrl, workItemId: workItem.id, workItemTitle: title, commentsCount: 1, authors: [author] });
+        if (thread.comments?.length > 0) {
+          const firstComment = thread.comments[0];
+          const isText = firstComment.commentType === 'text';
+          const author = firstComment.author.displayName;
+          
+          if (debug) {
+            debugLogs.prComments.push({
+              workItemId: workItem.id,
+              prId,
+              prUrl,
+              commentId: `${thread.id}-${firstComment.id}`,
+              author,
+              counted: isText,
+              reason: isText ? 'First comment in thread with text type' : `Excluded: commentType=${firstComment.commentType}`,
+            });
           }
+
+          if (isText) {
+            prAuthors.add(author);
+
+            if (!result[author]) result[author] = { count: 0, prs: [] };
+            const data = result[author];
+            data.count++;
+
+            const existing = data.prs.find(p => p.prId === prId);
+            if (existing) {
+              existing.commentsCount++;
+              if (!existing.authors.includes(author)) {
+                existing.authors.push(author);
+              }
+            } else {
+              data.prs.push({ prId, prUrl, workItemId: workItem.id, workItemTitle: title, commentsCount: 1, authors: [author] });
+            }
+          }
+          commentIndex++;
         }
       }
     } catch {
@@ -784,21 +929,21 @@ async function getPRCommentsForItem(
   return result;
 }
 
-// ============== Result Merging ==============
+// ============== Result Merging (Numeric Summation Only) ==============
 
-function mergeChunkResults(
+function mergeChunkResultsNumeric(
   chunks: ChunkResult[],
-  prAgg: Map<string, { count: number; prs: PRReference[] }>,
   workItems: WorkItem[]
 ): unknown {
   const mergedDevAgg: Record<string, DevAggData> = {};
   const mergedTesterAgg: Record<string, TesterAggData> = {};
+  const mergedPrAgg: Record<string, { count: number; prs: PRReference[] }> = {};
   const allTesters = new Set<string>();
   const unassignedItems: WorkItemReference[] = [];
   let totalDevHours = 0, totalDevTestHours = 0, totalStgTestHours = 0;
   let requirements = 0, bugs = 0, tasks = 0;
 
-  // Merge all chunks
+  // Merge all chunks with numeric summation
   for (const chunk of chunks) {
     requirements += chunk.requirements;
     bugs += chunk.bugs;
@@ -810,7 +955,7 @@ function mergeChunkResults(
 
     for (const t of chunk.testers) allTesters.add(t);
 
-    // Merge dev aggregates
+    // Merge dev aggregates (numeric summation)
     for (const [dev, data] of Object.entries(chunk.devAgg)) {
       if (!mergedDevAgg[dev]) {
         mergedDevAgg[dev] = { hours: 0, cycles: 0, cr: 0, dev: 0, stg: 0, completed: 0, items: [], returns: [], crReturns: [], devReturns: [], stgReturns: [] };
@@ -829,7 +974,7 @@ function mergeChunkResults(
       m.stgReturns.push(...data.stgReturns);
     }
 
-    // Merge tester aggregates
+    // Merge tester aggregates (numeric summation)
     for (const [tester, data] of Object.entries(chunk.testerAgg)) {
       if (!mergedTesterAgg[tester]) {
         mergedTesterAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
@@ -845,10 +990,17 @@ function mergeChunkResults(
       m.devItems.push(...data.devItems);
       m.stgItems.push(...data.stgItems);
     }
+
+    // Merge PR aggregates (numeric summation - already processed per chunk)
+    for (const [author, data] of Object.entries(chunk.prAgg)) {
+      if (!mergedPrAgg[author]) mergedPrAgg[author] = { count: 0, prs: [] };
+      mergedPrAgg[author].count += data.count;
+      mergedPrAgg[author].prs.push(...data.prs);
+    }
   }
 
   // Add PR comments to tester data
-  for (const [author, data] of prAgg) {
+  for (const [author, data] of Object.entries(mergedPrAgg)) {
     if (mergedTesterAgg[author]) {
       mergedTesterAgg[author].prsReviewed += data.prs.length;
       mergedTesterAgg[author].prDetails.push(...data.prs);
@@ -883,8 +1035,8 @@ function mergeChunkResults(
 
   const testerMetrics = Object.entries(mergedTesterAgg).map(([tester, t]) => {
     const taskCount = Math.max(t.devItems.length, t.stgItems.length, t.closed.length, 1);
-    const prCount = t.prsReviewed || (prAgg.get(tester)?.prs.length || 0);
-    const commentCount = prAgg.get(tester)?.count || 0;
+    const prCount = t.prsReviewed || (mergedPrAgg[tester]?.prs.length || 0);
+    const commentCount = mergedPrAgg[tester]?.count || 0;
 
     return {
       tester,
@@ -908,7 +1060,7 @@ function mergeChunkResults(
     };
   }).sort((a, b) => b.closedItemsCount - a.closedItemsCount);
 
-  const prCommentAuthors = Array.from(prAgg.entries()).map(([author, p]) => ({
+  const prCommentAuthors = Object.entries(mergedPrAgg).map(([author, p]) => ({
     author,
     count: p.count,
     isTester: allTesters.has(author),
@@ -916,7 +1068,7 @@ function mergeChunkResults(
   })).sort((a, b) => b.count - a.count);
 
   const totalReturns = developerMetrics.reduce((s, d) => s + d.totalReturnCount, 0);
-  const totalPrComments = Array.from(prAgg.values()).reduce((s, p) => s + p.count, 0);
+  const totalPrComments = Object.values(mergedPrAgg).reduce((s, p) => s + p.count, 0);
 
   const summary = {
     totalWorkItems: workItems.length,
