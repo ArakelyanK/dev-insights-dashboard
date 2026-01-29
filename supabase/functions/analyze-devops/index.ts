@@ -217,15 +217,52 @@ async function processJob(
       allChunkResults.push(...batchResults);
       processedChunks += chunkBatch.length;
 
-      // Aggregate chunk stats for telemetry
+      // Aggregate chunk stats for telemetry - EXTENDED counters
+      let batchCommentsFetched = 0;
+      let batchCommentsAggregated = 0;
+      let batchUniqueAuthors = new Set<string>();
+      let batchApiCalls = 0;
+      let maxChunkSize = 0;
+      let maxCommentsInChunk = 0;
+
       for (const result of batchResults) {
         totalPRsProcessed += result.prStats?.prs || 0;
         totalCommentsProcessed += result.prStats?.comments || 0;
+        
+        // Extended telemetry counters
+        batchCommentsFetched += result.prStats?.commentsFetched || 0;
+        batchCommentsAggregated += result.prStats?.commentsAggregated || 0;
+        batchApiCalls += result.prStats?.apiCalls || 0;
+        
+        // Track max chunk size for memory pressure detection
+        const chunkWorkItems = result.devAgg ? Object.values(result.devAgg).reduce((sum, d) => sum + d.items.length, 0) : 0;
+        if (chunkWorkItems > maxChunkSize) maxChunkSize = chunkWorkItems;
+        
+        const chunkComments = result.prStats?.commentsFetched || 0;
+        if (chunkComments > maxCommentsInChunk) maxCommentsInChunk = chunkComments;
+        
+        // Collect unique authors from PR aggregates
+        for (const author of Object.keys(result.prAgg)) {
+          batchUniqueAuthors.add(author);
+        }
       }
 
       chunkProcessStage.counts.prsProcessed = totalPRsProcessed;
       chunkProcessStage.counts.commentsProcessed = totalCommentsProcessed;
+      chunkProcessStage.counts.commentsFetched = batchCommentsFetched;
+      chunkProcessStage.counts.commentsAggregated = batchCommentsAggregated;
+      chunkProcessStage.counts.uniqueCommentAuthors = batchUniqueAuthors.size;
       logStageTelemetry(chunkProcessStage);
+      
+      // Memory-safety telemetry (cheap, always log)
+      console.log(`[Telemetry] ${JSON.stringify({
+        jobId,
+        stage: 'chunk_batch_memory',
+        maxChunkSize,
+        totalCommentsInChunk: maxCommentsInChunk,
+        batchApiCalls,
+        chunksInBatch: chunkBatch.length,
+      })}`);
 
       // Save chunk results to database for recovery - with error handling
       const persistStage = startStage(jobId, 'persist_chunks');
@@ -399,7 +436,14 @@ interface ChunkResult {
   requirements: number;
   bugs: number;
   tasks: number;
-  prStats?: { prs: number; comments: number };
+  prStats?: { 
+    prs: number; 
+    comments: number;
+    commentsFetched: number;
+    commentsAggregated: number;
+    uniqueCommentAuthors: number;
+    apiCalls: number;
+  };
 }
 
 interface DevAggData {
@@ -906,7 +950,14 @@ async function processWorkItemChunkWithPRs(
 
 interface PRProcessResult {
   aggregates: Record<string, { count: number; prs: PRReference[] }>;
-  stats: { prs: number; comments: number };
+  stats: { 
+    prs: number; 
+    comments: number;
+    commentsFetched: number;
+    commentsAggregated: number;
+    uniqueCommentAuthors: number;
+    apiCalls: number;
+  };
 }
 
 async function processPRCommentsForChunk(
@@ -921,7 +972,19 @@ async function processPRCommentsForChunk(
   const prAgg: Record<string, { count: number; prs: PRReference[] }> = {};
   let totalPRs = 0;
   let totalComments = 0;
+  let totalCommentsFetched = 0;
+  let totalCommentsAggregated = 0;
+  let totalApiCalls = 0;
+  const allAuthors = new Set<string>();
   const PR_BATCH_SIZE = 15;
+
+  // Stage telemetry for PR fetching
+  const prFetchStage: StageTelemetry = {
+    jobId,
+    stage: 'fetch_pr_comments',
+    startTime: Date.now(),
+    counts: {},
+  };
 
   for (let i = 0; i < workItems.length; i += PR_BATCH_SIZE) {
     const batch = workItems.slice(i, i + PR_BATCH_SIZE);
@@ -930,8 +993,12 @@ async function processPRCommentsForChunk(
     for (const result of results) {
       totalPRs += result.prCount;
       totalComments += result.commentCount;
+      totalCommentsFetched += result.commentsFetched;
+      totalCommentsAggregated += result.commentsAggregated;
+      totalApiCalls += result.apiCalls;
       
       for (const [author, data] of Object.entries(result.aggregates)) {
+        allAuthors.add(author);
         if (!prAgg[author]) prAgg[author] = { count: 0, prs: [] };
         prAgg[author].count += data.count;
         prAgg[author].prs.push(...data.prs);
@@ -939,9 +1006,24 @@ async function processPRCommentsForChunk(
     }
   }
 
+  // Log stage telemetry for PR fetching (aggregate only)
+  prFetchStage.counts = {
+    prsFetched: totalPRs,
+    apiCalls: totalApiCalls,
+    commentsFetched: totalCommentsFetched,
+  };
+  logStageTelemetry(prFetchStage);
+
   return { 
     aggregates: prAgg, 
-    stats: { prs: totalPRs, comments: totalComments } 
+    stats: { 
+      prs: totalPRs, 
+      comments: totalComments,
+      commentsFetched: totalCommentsFetched,
+      commentsAggregated: totalCommentsAggregated,
+      uniqueCommentAuthors: allAuthors.size,
+      apiCalls: totalApiCalls,
+    } 
   };
 }
 
@@ -949,6 +1031,9 @@ interface PRItemResult {
   aggregates: Record<string, { count: number; prs: PRReference[] }>;
   prCount: number;
   commentCount: number;
+  commentsFetched: number;
+  commentsAggregated: number;
+  apiCalls: number;
 }
 
 async function getPRCommentsForItem(
@@ -962,63 +1047,78 @@ async function getPRCommentsForItem(
   const result: Record<string, { count: number; prs: PRReference[] }> = {};
   let prCount = 0;
   let commentCount = 0;
+  let commentsFetched = 0;
+  let commentsAggregated = 0;
+  let apiCalls = 0;
 
-  if (!workItem.relations) return { aggregates: result, prCount: 0, commentCount: 0 };
-
-  const prLinks = workItem.relations.filter(r => r.rel === 'ArtifactLink' && r.url.includes('PullRequestId'));
+  const prLinks = workItem.relations?.filter(r => r.rel === 'ArtifactLink' && r.attributes?.name === 'Pull Request') || [];
   const title = workItem.fields['System.Title'] as string;
 
   for (const link of prLinks) {
+    const vstfsMatch = link.url.match(/vstfs:\/\/\/Git\/PullRequestId\/([^%]+)%2F([^%]+)%2F(\d+)/);
+    if (!vstfsMatch) continue;
+
+    const [, projectId, repoId, prIdStr] = vstfsMatch;
+    const prId = prIdStr;
+    prCount++;
+
     try {
-      const match = link.url.match(/PullRequestId\/[^%]+%2F([^%]+)%2F(\d+)/);
-      if (!match) continue;
+      // API call to get PR details
+      apiCalls++;
+      const pr = await azureRequest(
+        `https://dev.azure.com/${org}/${project}/_apis/git/repositories/${repoId}/pullrequests/${prId}?api-version=7.1`,
+        pat
+      ) as { pullRequestId: number; repository: { webUrl: string } };
 
-      const [, repoId, prId] = match;
-      const url = `https://dev.azure.com/${org}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=7.1`;
-      const threads = await azureRequest(url, pat) as { value: Array<{ id: number; comments: Array<{ id: number; author: { displayName: string }; commentType: string }> }> };
+      const prUrl = `${pr.repository.webUrl}/pullrequest/${pr.pullRequestId}`;
 
-      const prUrl = `https://dev.azure.com/${org}/${project}/_git/${repoId}/pullrequest/${prId}`;
-      prCount++;
-      
-      // Collect all authors for this PR
-      const prAuthors: Set<string> = new Set();
+      // API call to get threads
+      apiCalls++;
+      const threadsResponse = await azureRequest(
+        `https://dev.azure.com/${org}/${project}/_apis/git/repositories/${repoId}/pullrequests/${prId}/threads?api-version=7.1`,
+        pat
+      ) as { value: Array<{ id: number; comments: Array<{ id: number; author: { displayName: string }; commentType: string }> }> };
 
-      for (const thread of threads.value) {
-        if (thread.comments?.length > 0) {
-          const firstComment = thread.comments[0];
-          const isText = firstComment.commentType === 'text';
-          const author = firstComment.author.displayName;
-          
-          // VERBOSE debug logging (only for small queries)
-          if (isVerbose) {
-            debugLogs.prComments.push({
-              workItemId: workItem.id,
-              prId,
-              prUrl,
-              commentId: `${thread.id}-${firstComment.id}`,
-              author,
-              counted: isText,
-              reason: isText ? 'First comment in thread with text type' : `Excluded: commentType=${firstComment.commentType}`,
-            });
-          }
+      const prAuthors = new Set<string>();
 
-          if (isText) {
-            prAuthors.add(author);
-            commentCount++;
+      for (const thread of threadsResponse.value || []) {
+        if (!thread.comments?.length) continue;
+        const firstComment = thread.comments[0];
+        commentsFetched++;
+        
+        const author = firstComment.author?.displayName || 'Unknown';
+        const isText = firstComment.commentType === 'text';
 
-            if (!result[author]) result[author] = { count: 0, prs: [] };
-            const data = result[author];
-            data.count++;
+        // VERBOSE debug logging (only for small queries)
+        if (isVerbose) {
+          debugLogs.prComments.push({
+            workItemId: workItem.id,
+            prId,
+            prUrl,
+            commentId: `${thread.id}-${firstComment.id}`,
+            author,
+            counted: isText,
+            reason: isText ? 'First comment in thread with text type' : `Excluded: commentType=${firstComment.commentType}`,
+          });
+        }
 
-            const existing = data.prs.find(p => p.prId === prId);
-            if (existing) {
-              existing.commentsCount++;
-              if (!existing.authors.includes(author)) {
-                existing.authors.push(author);
-              }
-            } else {
-              data.prs.push({ prId, prUrl, workItemId: workItem.id, workItemTitle: title, commentsCount: 1, authors: [author] });
+        if (isText) {
+          prAuthors.add(author);
+          commentCount++;
+          commentsAggregated++;
+
+          if (!result[author]) result[author] = { count: 0, prs: [] };
+          const data = result[author];
+          data.count++;
+
+          const existing = data.prs.find(p => p.prId === prId);
+          if (existing) {
+            existing.commentsCount++;
+            if (!existing.authors.includes(author)) {
+              existing.authors.push(author);
             }
+          } else {
+            data.prs.push({ prId, prUrl, workItemId: workItem.id, workItemTitle: title, commentsCount: 1, authors: [author] });
           }
         }
       }
@@ -1027,7 +1127,7 @@ async function getPRCommentsForItem(
     }
   }
 
-  return { aggregates: result, prCount, commentCount };
+  return { aggregates: result, prCount, commentCount, commentsFetched, commentsAggregated, apiCalls };
 }
 
 // ============== Result Merging (Numeric Summation Only) ==============
