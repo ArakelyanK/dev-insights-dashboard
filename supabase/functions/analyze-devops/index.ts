@@ -9,7 +9,7 @@ const corsHeaders = {
 
 const CHUNK_SIZE = 50; // Work items per chunk
 const CHUNK_CONCURRENCY = 4; // Parallel chunk processing limit
-const DEBUG_THRESHOLD = 20; // Auto-enable debug for <= 20 items
+const DEBUG_THRESHOLD = 20; // Auto-enable verbose debug for <= 20 items
 
 interface AnalysisRequest {
   organization: string;
@@ -18,6 +18,34 @@ interface AnalysisRequest {
   pat: string;
   debug?: boolean;
 }
+
+// ============== Stage Telemetry ==============
+
+interface StageTelemetry {
+  jobId: string;
+  stage: string;
+  startTime: number;
+  endTime?: number;
+  durationMs?: number;
+  counts: Record<string, number>;
+}
+
+function logStageTelemetry(telemetry: StageTelemetry) {
+  telemetry.endTime = Date.now();
+  telemetry.durationMs = telemetry.endTime - telemetry.startTime;
+  console.log(`[Telemetry] ${JSON.stringify(telemetry)}`);
+}
+
+function startStage(jobId: string, stage: string): StageTelemetry {
+  return {
+    jobId,
+    stage,
+    startTime: Date.now(),
+    counts: {},
+  };
+}
+
+// ============== Azure DevOps API ==============
 
 async function azureRequest(url: string, pat: string): Promise<unknown> {
   const auth = btoa(`:${pat}`);
@@ -62,10 +90,11 @@ serve(async (req) => {
     // Fetch work item IDs from Azure DevOps
     const workItemIds = await executeQuery(organization, project, queryId, pat);
     
-    // Deterministic DEBUG mode: auto-enable for small queries
-    const debug = requestDebug || workItemIds.length <= DEBUG_THRESHOLD;
+    // Determine debug mode: verbose for small queries, aggregated for large
+    const isVerboseDebug = workItemIds.length <= DEBUG_THRESHOLD;
+    const debugMode = requestDebug || isVerboseDebug ? (isVerboseDebug ? 'verbose' : 'aggregated') : 'none';
     
-    console.log(`[Job Init] Starting analysis for ${organization}/${project} (${workItemIds.length} items)${debug ? ' [DEBUG MODE]' : ''}`);
+    console.log(`[Job Init] Starting analysis for ${organization}/${project} (${workItemIds.length} items) [DEBUG: ${debugMode}]`);
 
     // Handle empty query result
     if (workItemIds.length === 0) {
@@ -113,14 +142,14 @@ serve(async (req) => {
 
     // Use EdgeRuntime.waitUntil to process in background
     // @ts-ignore - EdgeRuntime is available in Supabase Edge Functions
-    EdgeRuntime.waitUntil(processJob(supabase, jobId, organization, project, pat, workItemIds, debug));
+    EdgeRuntime.waitUntil(processJob(supabase, jobId, organization, project, pat, workItemIds, debugMode));
 
     return new Response(JSON.stringify({
       jobId,
       status: 'processing',
       totalItems: workItemIds.length,
       totalChunks,
-      debugEnabled: debug,
+      debugMode,
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   } catch (error) {
@@ -132,7 +161,7 @@ serve(async (req) => {
   }
 });
 
-// Background processing function
+// Background processing function with proper error handling
 async function processJob(
   supabase: ReturnType<typeof createClient>,
   jobId: string,
@@ -140,47 +169,66 @@ async function processJob(
   project: string,
   pat: string,
   workItemIds: number[],
-  debug: boolean
+  debugMode: 'verbose' | 'aggregated' | 'none'
 ) {
+  const isVerbose = debugMode === 'verbose';
   const debugLogs: DebugOutput = { workItems: {}, prComments: [] };
 
   try {
-    console.log(`[Job ${jobId}] Starting background processing${debug ? ' [DEBUG]' : ''}`);
+    console.log(`[Job ${jobId}] Starting background processing [DEBUG: ${debugMode}]`);
 
-    // Step 1: Fetch all work items with relations (batched)
+    // Stage 1: Fetch all work items with relations (batched)
+    const fetchStage = startStage(jobId, 'fetch_work_items');
     await updateJobStatus(supabase, jobId, 'Fetching work items...');
     const workItems = await fetchWorkItemsBatched(organization, project, workItemIds, pat);
+    fetchStage.counts = { workItems: workItems.length };
+    logStageTelemetry(fetchStage);
     console.log(`[Job ${jobId}] Fetched ${workItems.length} work items`);
 
-    // Step 2: Process work items in chunks with parallel concurrency
+    // Stage 2: Process work items in chunks with parallel concurrency
     const chunks = chunkArray(workItems, CHUNK_SIZE);
     const allChunkResults: ChunkResult[] = [];
     let processedChunks = 0;
+    let totalPRsProcessed = 0;
+    let totalCommentsProcessed = 0;
 
     // Process chunks in parallel batches with concurrency limit
     for (let i = 0; i < chunks.length; i += CHUNK_CONCURRENCY) {
       const chunkBatch = chunks.slice(i, Math.min(i + CHUNK_CONCURRENCY, chunks.length));
+      const batchEndIdx = Math.min(i + CHUNK_CONCURRENCY, chunks.length);
       
       await updateJobStatus(
         supabase, 
         jobId, 
-        `Processing chunks ${i + 1}-${Math.min(i + CHUNK_CONCURRENCY, chunks.length)}/${chunks.length}`,
+        `Processing chunks ${i + 1}-${batchEndIdx}/${chunks.length}`,
         Math.round((processedChunks / chunks.length) * 70)
       );
       
-      console.log(`[Job ${jobId}] Processing chunks ${i + 1} to ${Math.min(i + CHUNK_CONCURRENCY, chunks.length)}/${chunks.length}`);
+      const chunkProcessStage = startStage(jobId, 'process_chunk_batch');
+      chunkProcessStage.counts = { batchStart: i + 1, batchEnd: batchEndIdx, totalChunks: chunks.length };
 
       // Process chunk batch in parallel - including PR comments per chunk
       const batchResults = await Promise.all(
         chunkBatch.map((chunk, idx) => 
-          processWorkItemChunkWithPRs(organization, project, pat, chunk, debug, debugLogs, jobId, i + idx)
+          processWorkItemChunkWithPRs(organization, project, pat, chunk, isVerbose, debugLogs, jobId, i + idx)
         )
       );
 
       allChunkResults.push(...batchResults);
       processedChunks += chunkBatch.length;
 
-      // Save chunk results to database for recovery
+      // Aggregate chunk stats for telemetry
+      for (const result of batchResults) {
+        totalPRsProcessed += result.prStats?.prs || 0;
+        totalCommentsProcessed += result.prStats?.comments || 0;
+      }
+
+      chunkProcessStage.counts.prsProcessed = totalPRsProcessed;
+      chunkProcessStage.counts.commentsProcessed = totalCommentsProcessed;
+      logStageTelemetry(chunkProcessStage);
+
+      // Save chunk results to database for recovery - with error handling
+      const persistStage = startStage(jobId, 'persist_chunks');
       for (let j = 0; j < batchResults.length; j++) {
         const chunkData = {
           job_id: jobId,
@@ -188,41 +236,71 @@ async function processJob(
           chunk_type: 'work_items_with_prs',
           data: batchResults[j],
         };
-        await (supabase.from('analysis_chunks') as any).insert(chunkData);
+        
+        const { error: insertError } = await (supabase.from('analysis_chunks') as any).insert(chunkData);
+        
+        if (insertError) {
+          console.error(`[Job ${jobId}] Failed to persist chunk ${i + j}:`, insertError);
+          throw new Error(`Failed to persist chunk ${i + j}: ${insertError.message}`);
+        }
       }
+      persistStage.counts = { chunksStored: batchResults.length };
+      logStageTelemetry(persistStage);
     }
 
-    // Step 3: Merge all results (numeric summation only)
+    // Stage 3: Merge all results (numeric summation only)
+    const mergeStage = startStage(jobId, 'merge_chunks');
     await updateJobStatus(supabase, jobId, 'Merging results...', 90);
     const finalResult = mergeChunkResultsNumeric(allChunkResults, workItems);
+    mergeStage.counts = { chunksProcessed: allChunkResults.length };
+    logStageTelemetry(mergeStage);
     
-    // Add debug logs if enabled
-    if (debug) {
+    // Add debug logs if verbose mode enabled
+    if (isVerbose) {
       (finalResult as any).debugLogs = debugLogs;
       console.log(`[Job ${jobId}] Debug logs: ${Object.keys(debugLogs.workItems).length} work items, ${debugLogs.prComments.length} PR comments`);
     }
     
     console.log(`[Job ${jobId}] Merged ${allChunkResults.length} chunks`);
 
-    // Step 4: Save final result
+    // Stage 4: Save final result
+    const persistResultStage = startStage(jobId, 'persist_result');
     const completedUpdate = {
       status: 'completed',
       processed_items: workItemIds.length,
       current_step: 'Complete',
       result: finalResult,
     };
-    await (supabase.from('analysis_jobs') as any).update(completedUpdate).eq('id', jobId);
+    
+    const { error: updateError } = await (supabase.from('analysis_jobs') as any)
+      .update(completedUpdate)
+      .eq('id', jobId);
+    
+    if (updateError) {
+      throw new Error(`Failed to persist final result: ${updateError.message}`);
+    }
+    
+    persistResultStage.counts = { success: 1 };
+    logStageTelemetry(persistResultStage);
 
     console.log(`[Job ${jobId}] Completed successfully`);
 
   } catch (error) {
     console.error(`[Job ${jobId}] Failed:`, error);
+    
+    // Ensure we always update job status on failure
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     const failedUpdate = {
       status: 'failed',
-      error_message: error instanceof Error ? error.message : 'Unknown error',
+      error_message: errorMessage,
       current_step: 'Failed',
     };
-    await (supabase.from('analysis_jobs') as any).update(failedUpdate).eq('id', jobId);
+    
+    try {
+      await (supabase.from('analysis_jobs') as any).update(failedUpdate).eq('id', jobId);
+    } catch (updateErr) {
+      console.error(`[Job ${jobId}] Failed to update job status:`, updateErr);
+    }
   }
 }
 
@@ -235,18 +313,6 @@ async function updateJobStatus(supabase: ReturnType<typeof createClient>, jobId:
 }
 
 // ============== Azure DevOps API Functions ==============
-
-async function azureRequest2(url: string, pat: string): Promise<unknown> {
-  const auth = btoa(`:${pat}`);
-  const response = await fetch(url, {
-    headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Azure API error (${response.status}): ${text}`);
-  }
-  return response.json();
-}
 
 interface WorkItem {
   id: number;
@@ -267,7 +333,7 @@ async function fetchWorkItemsBatched(org: string, project: string, ids: number[]
   for (let i = 0; i < ids.length; i += BATCH_SIZE) {
     const batchIds = ids.slice(i, i + BATCH_SIZE);
     const url = `https://dev.azure.com/${org}/${project}/_apis/wit/workitems?ids=${batchIds.join(',')}&$expand=relations&api-version=7.1`;
-    const result = await azureRequest2(url, pat) as { value: WorkItem[] };
+    const result = await azureRequest(url, pat) as { value: WorkItem[] };
     allItems.push(...result.value);
   }
 
@@ -276,7 +342,7 @@ async function fetchWorkItemsBatched(org: string, project: string, ids: number[]
 
 async function getWorkItemRevisions(org: string, project: string, workItemId: number, pat: string): Promise<WorkItemRevision[]> {
   const url = `https://dev.azure.com/${org}/${project}/_apis/wit/workitems/${workItemId}/revisions?api-version=7.1`;
-  const result = await azureRequest2(url, pat) as { value: WorkItemRevision[] };
+  const result = await azureRequest(url, pat) as { value: WorkItemRevision[] };
   return result.value;
 }
 
@@ -333,6 +399,7 @@ interface ChunkResult {
   requirements: number;
   bugs: number;
   tasks: number;
+  prStats?: { prs: number; comments: number };
 }
 
 interface DevAggData {
@@ -637,7 +704,7 @@ async function processWorkItemChunkWithPRs(
   project: string,
   pat: string,
   workItems: WorkItem[],
-  debug: boolean,
+  isVerbose: boolean,
   debugLogs: DebugOutput,
   jobId: string,
   chunkIndex: number
@@ -660,7 +727,7 @@ async function processWorkItemChunkWithPRs(
   });
 
   // Process revisions in parallel (small batches to avoid CPU spikes)
-  const REVISION_BATCH = 10;
+  const REVISION_BATCH = 20;
   for (let i = 0; i < metricsItems.length; i += REVISION_BATCH) {
     const batch = metricsItems.slice(i, i + REVISION_BATCH);
     const revisionsBatch = await Promise.all(
@@ -762,8 +829,8 @@ async function processWorkItemChunkWithPRs(
         }
       }
 
-      // Debug logging per work item
-      if (debug) {
+      // VERBOSE debug logging per work item (only for small queries)
+      if (isVerbose) {
         debugLogs.workItems[wi.id] = {
           workItemId: wi.id,
           title,
@@ -812,36 +879,59 @@ async function processWorkItemChunkWithPRs(
   }
 
   // Process PR comments for this chunk's work items
-  const prResult = await processPRCommentsForChunk(org, project, pat, workItems, debug, debugLogs, jobId);
-  for (const [author, data] of Object.entries(prResult)) {
+  const prResult = await processPRCommentsForChunk(org, project, pat, workItems, isVerbose, debugLogs, jobId);
+  for (const [author, data] of Object.entries(prResult.aggregates)) {
     if (!prAgg[author]) prAgg[author] = { count: 0, prs: [] };
     prAgg[author].count += data.count;
     prAgg[author].prs.push(...data.prs);
   }
 
-  return { devAgg, testerAgg, prAgg, testers, unassignedItems, totalDevHours, totalDevTestHours, totalStgTestHours, requirements, bugs, tasks };
+  return { 
+    devAgg, 
+    testerAgg, 
+    prAgg, 
+    testers, 
+    unassignedItems, 
+    totalDevHours, 
+    totalDevTestHours, 
+    totalStgTestHours, 
+    requirements, 
+    bugs, 
+    tasks,
+    prStats: prResult.stats,
+  };
 }
 
 // ============== PR Comments Processing Per Chunk ==============
+
+interface PRProcessResult {
+  aggregates: Record<string, { count: number; prs: PRReference[] }>;
+  stats: { prs: number; comments: number };
+}
 
 async function processPRCommentsForChunk(
   org: string,
   project: string,
   pat: string,
   workItems: WorkItem[],
-  debug: boolean,
+  isVerbose: boolean,
   debugLogs: DebugOutput,
   jobId: string
-): Promise<Record<string, { count: number; prs: PRReference[] }>> {
+): Promise<PRProcessResult> {
   const prAgg: Record<string, { count: number; prs: PRReference[] }> = {};
+  let totalPRs = 0;
+  let totalComments = 0;
   const PR_BATCH_SIZE = 15;
 
   for (let i = 0; i < workItems.length; i += PR_BATCH_SIZE) {
     const batch = workItems.slice(i, i + PR_BATCH_SIZE);
-    const results = await Promise.all(batch.map(wi => getPRCommentsForItem(org, project, wi, pat, debug, debugLogs)));
+    const results = await Promise.all(batch.map(wi => getPRCommentsForItem(org, project, wi, pat, isVerbose, debugLogs)));
 
     for (const result of results) {
-      for (const [author, data] of Object.entries(result)) {
+      totalPRs += result.prCount;
+      totalComments += result.commentCount;
+      
+      for (const [author, data] of Object.entries(result.aggregates)) {
         if (!prAgg[author]) prAgg[author] = { count: 0, prs: [] };
         prAgg[author].count += data.count;
         prAgg[author].prs.push(...data.prs);
@@ -849,7 +939,16 @@ async function processPRCommentsForChunk(
     }
   }
 
-  return prAgg;
+  return { 
+    aggregates: prAgg, 
+    stats: { prs: totalPRs, comments: totalComments } 
+  };
+}
+
+interface PRItemResult {
+  aggregates: Record<string, { count: number; prs: PRReference[] }>;
+  prCount: number;
+  commentCount: number;
 }
 
 async function getPRCommentsForItem(
@@ -857,17 +956,17 @@ async function getPRCommentsForItem(
   project: string,
   workItem: WorkItem,
   pat: string,
-  debug: boolean,
+  isVerbose: boolean,
   debugLogs: DebugOutput
-): Promise<Record<string, { count: number; prs: PRReference[] }>> {
+): Promise<PRItemResult> {
   const result: Record<string, { count: number; prs: PRReference[] }> = {};
+  let prCount = 0;
+  let commentCount = 0;
 
-  if (!workItem.relations) return result;
+  if (!workItem.relations) return { aggregates: result, prCount: 0, commentCount: 0 };
 
   const prLinks = workItem.relations.filter(r => r.rel === 'ArtifactLink' && r.url.includes('PullRequestId'));
   const title = workItem.fields['System.Title'] as string;
-
-  let commentIndex = 0;
 
   for (const link of prLinks) {
     try {
@@ -876,9 +975,10 @@ async function getPRCommentsForItem(
 
       const [, repoId, prId] = match;
       const url = `https://dev.azure.com/${org}/${project}/_apis/git/repositories/${repoId}/pullRequests/${prId}/threads?api-version=7.1`;
-      const threads = await azureRequest2(url, pat) as { value: Array<{ id: number; comments: Array<{ id: number; author: { displayName: string }; commentType: string }> }> };
+      const threads = await azureRequest(url, pat) as { value: Array<{ id: number; comments: Array<{ id: number; author: { displayName: string }; commentType: string }> }> };
 
       const prUrl = `https://dev.azure.com/${org}/${project}/_git/${repoId}/pullrequest/${prId}`;
+      prCount++;
       
       // Collect all authors for this PR
       const prAuthors: Set<string> = new Set();
@@ -889,7 +989,8 @@ async function getPRCommentsForItem(
           const isText = firstComment.commentType === 'text';
           const author = firstComment.author.displayName;
           
-          if (debug) {
+          // VERBOSE debug logging (only for small queries)
+          if (isVerbose) {
             debugLogs.prComments.push({
               workItemId: workItem.id,
               prId,
@@ -903,6 +1004,7 @@ async function getPRCommentsForItem(
 
           if (isText) {
             prAuthors.add(author);
+            commentCount++;
 
             if (!result[author]) result[author] = { count: 0, prs: [] };
             const data = result[author];
@@ -918,7 +1020,6 @@ async function getPRCommentsForItem(
               data.prs.push({ prId, prUrl, workItemId: workItem.id, workItemTitle: title, commentsCount: 1, authors: [author] });
             }
           }
-          commentIndex++;
         }
       }
     } catch {
@@ -926,7 +1027,7 @@ async function getPRCommentsForItem(
     }
   }
 
-  return result;
+  return { aggregates: result, prCount, commentCount };
 }
 
 // ============== Result Merging (Numeric Summation Only) ==============
