@@ -8,9 +8,9 @@ const corsHeaders = {
 };
 
 const CHUNK_SIZE = 50; // Work items per chunk
-const CHUNK_CONCURRENCY = 4; // Parallel chunk processing limit
+const CHUNK_CONCURRENCY = 1; // Process ONE chunk at a time to stay within CPU limits
 const DEBUG_THRESHOLD = 20; // Auto-enable verbose debug for <= 20 items
-const MAX_BATCH_TIME_MS = 45000; // Max time per batch (~45s to leave buffer before CPU limit)
+const MAX_BATCH_TIME_MS = 25000; // Max time per batch (~25s to leave large buffer before CPU limit)
 const STALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes - mark job failed if no progress
 
 interface AnalysisRequest {
