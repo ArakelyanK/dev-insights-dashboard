@@ -6,6 +6,7 @@ interface JobResponse {
   status: 'processing' | 'completed' | 'failed';
   totalItems?: number;
   totalChunks?: number;
+  completedChunks?: number;
   result?: AnalysisResult;
   error?: string;
 }
@@ -20,19 +21,38 @@ interface JobStatusResponse {
   error?: string;
 }
 
-const POLL_INTERVAL = 2000; // 2 seconds
-const MAX_POLL_TIME = 1800000; // 30 minutes max - never timeout while job is running
+interface ChunkProcessResponse {
+  jobId: string;
+  status: 'processing' | 'completed' | 'failed';
+  completedChunks?: number;
+  totalChunks?: number;
+  progress?: number;
+  message?: string;
+  result?: AnalysisResult;
+  error?: string;
+}
+
+const STATUS_POLL_INTERVAL = 1000; // 1 second for status checks
+const CHUNK_PROCESS_INTERVAL = 500; // 500ms between chunk processing calls
+const MAX_POLL_TIME = 1800000; // 30 minutes max
+const STALL_TIMEOUT = 5 * 60 * 1000; // 5 minutes - match backend
 
 /**
  * Calls the backend edge function to analyze Azure DevOps metrics.
- * Uses job-based background processing for large queries.
+ * Uses pull-based chunk processing for reliable large query handling.
  * PAT is sent securely and never stored.
+ * 
+ * Architecture:
+ * 1. analyze-devops creates job + precomputes chunks
+ * 2. This function drives processing by calling process-chunk repeatedly
+ * 3. Each process-chunk call processes exactly ONE chunk
+ * 4. No self-invocation, no waitUntil, no recursion
  */
 export async function analyzeMetrics(
   request: AnalysisRequest,
   onProgress?: (step: string, progress: number) => void
 ): Promise<AnalysisResult> {
-  // Step 1: Start the analysis job
+  // Step 1: Create the job (no processing happens here)
   const { data, error } = await supabase.functions.invoke('analyze-devops', {
     body: request,
   });
@@ -52,62 +72,134 @@ export async function analyzeMetrics(
     throw new Error('Failed to create analysis job');
   }
 
-  // Step 2: Poll for job completion
-  return pollJobStatus(jobResponse.jobId, onProgress);
+  const jobId = jobResponse.jobId;
+  const totalChunks = jobResponse.totalChunks || 1;
+  
+  if (onProgress) {
+    onProgress(`Job created: ${jobResponse.totalItems} items in ${totalChunks} chunks`, 0);
+  }
+
+  // Step 2: Drive chunk processing with pull-based loop
+  return driveChunkProcessing(jobId, request.pat, totalChunks, onProgress);
 }
 
 /**
- * Poll job status until completion or failure
+ * Pull-based chunk processing driver.
+ * Repeatedly calls process-chunk until all chunks are done.
+ * Each call processes exactly ONE chunk - no recursion, no self-invocation.
  */
-async function pollJobStatus(
+async function driveChunkProcessing(
   jobId: string,
+  pat: string,
+  totalChunks: number,
   onProgress?: (step: string, progress: number) => void
 ): Promise<AnalysisResult> {
   const startTime = Date.now();
+  let lastProgressTime = Date.now();
+  let completedChunks = 0;
 
   while (Date.now() - startTime < MAX_POLL_TIME) {
+    // Check for stall
+    if (Date.now() - lastProgressTime > STALL_TIMEOUT) {
+      throw new Error('Analysis stalled: no progress for 5 minutes. Please try again.');
+    }
 
-    // Use fetch directly for GET request with query params
-    const response = await fetch(
-      `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/job-status?jobId=${jobId}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-          'apikey': import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-        },
+    try {
+      // Call process-chunk to process exactly ONE chunk
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/process-chunk`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            'apikey': import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+          },
+          body: JSON.stringify({ jobId, pat }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to process chunk');
       }
-    );
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error || 'Failed to fetch job status');
+      const chunkResponse = await response.json() as ChunkProcessResponse;
+
+      // Update progress tracking
+      if (chunkResponse.completedChunks !== undefined && chunkResponse.completedChunks > completedChunks) {
+        completedChunks = chunkResponse.completedChunks;
+        lastProgressTime = Date.now();
+      }
+
+      // Update progress callback
+      if (onProgress) {
+        const progress = chunkResponse.progress || Math.round((completedChunks / totalChunks) * 100);
+        const step = chunkResponse.message || `Processing chunk ${completedChunks}/${totalChunks}`;
+        onProgress(step, progress);
+      }
+
+      // Check for completion
+      if (chunkResponse.status === 'completed' && chunkResponse.result) {
+        return chunkResponse.result;
+      }
+
+      // Check for failure
+      if (chunkResponse.status === 'failed') {
+        throw new Error(chunkResponse.error || 'Analysis job failed');
+      }
+
+      // Continue to next chunk after short delay
+      await new Promise(resolve => setTimeout(resolve, CHUNK_PROCESS_INTERVAL));
+
+    } catch (fetchError) {
+      // On network error, check job status before giving up
+      console.error('Chunk processing error:', fetchError);
+      
+      // Wait and try to check job status
+      await new Promise(resolve => setTimeout(resolve, STATUS_POLL_INTERVAL * 2));
+      
+      const status = await checkJobStatus(jobId);
+      if (status.status === 'completed' && status.result) {
+        return status.result;
+      }
+      if (status.status === 'failed') {
+        throw new Error(status.error || 'Analysis job failed');
+      }
+      
+      // Continue trying if job is still processing
+      if (status.status === 'processing') {
+        lastProgressTime = Date.now(); // Reset stall timer
+        continue;
+      }
+      
+      throw fetchError;
     }
-
-    const status = await response.json() as JobStatusResponse;
-
-    // Update progress callback
-    if (onProgress && status.currentStep) {
-      const progress = status.totalItems > 0 
-        ? Math.round((status.processedItems / 100) * 100)
-        : 0;
-      onProgress(status.currentStep, progress);
-    }
-
-    // Check for completion
-    if (status.status === 'completed' && status.result) {
-      return status.result;
-    }
-
-    // Check for failure
-    if (status.status === 'failed') {
-      throw new Error(status.error || 'Analysis job failed');
-    }
-
-    // Wait before next poll
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
   }
 
   throw new Error('Analysis timed out. Please try with a smaller query.');
+}
+
+/**
+ * Check job status without processing
+ */
+async function checkJobStatus(jobId: string): Promise<JobStatusResponse> {
+  const response = await fetch(
+    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/job-status?jobId=${jobId}`,
+    {
+      headers: {
+        'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        'apikey': import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+      },
+    }
+  );
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(errorData.error || 'Failed to fetch job status');
+  }
+
+  return response.json();
 }
 
 /**
