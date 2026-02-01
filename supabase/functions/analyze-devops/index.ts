@@ -45,6 +45,92 @@ function startStage(jobId: string, stage: string): StageTelemetry {
   };
 }
 
+// ============== Domain Debug Logging (Verbose Mode Only) ==============
+
+interface DomainDebugLog {
+  workItemId: number;
+  title: string;
+  type: string;
+  currentState: string;
+  attribution: {
+    currentAssignedTo: string;
+    fallbackUsed: boolean;
+    assignedToHistory: string[];
+  };
+  stateTransitions: Array<{
+    fromState: string;
+    toState: string;
+    enteredAt: string;
+    leftAt: string;
+    durationHours: number;
+    changedBy: string | null;
+    assignedToAtTransition: string | null;
+  }>;
+  developmentTime: {
+    activePeriods: Array<{
+      start: string;
+      end: string | null;
+      durationHours: number;
+      included: boolean;
+      exclusionReason?: string;
+    }>;
+    totalActiveHours: number;
+    developmentCycles: number;
+    stoppedAtFirstDevAcceptance: boolean;
+  };
+  testingCycles: {
+    dev: Array<{
+      tester: string;
+      cycleNumber: number;
+      periods: Array<{
+        start: string;
+        end: string;
+        durationHours: number;
+      }>;
+      merged: boolean;
+      mergeReason?: string;
+      iterationsCounted: number;
+      closingStatus: string;
+    }>;
+    stg: Array<{
+      tester: string;
+      cycleNumber: number;
+      periods: Array<{
+        start: string;
+        end: string;
+        durationHours: number;
+      }>;
+      merged: boolean;
+      mergeReason?: string;
+      iterationsCounted: number;
+      closingStatus: string;
+    }>;
+  };
+  fixRequiredReturns: Array<{
+    sourceState: string;
+    timestamp: string;
+    changedBy: string | null;
+    category: 'codeReview' | 'devTesting' | 'stgTesting' | 'other';
+    attributedTo: string;
+  }>;
+  finalContribution: {
+    devActiveTimeHours: number;
+    devTestTimeHours: number;
+    stgTestTimeHours: number;
+    codeReviewReturns: number;
+    devTestingReturns: number;
+    stgTestingReturns: number;
+    totalReturns: number;
+    itemCompleted: boolean;
+    attributedDeveloper: string;
+    attributedTesters: string[];
+  };
+}
+
+function emitDomainDebugLog(log: DomainDebugLog, jobId: string) {
+  console.log(`[DomainDebug] ${JSON.stringify({ jobId, ...log })}`);
+}
+
 // ============== Azure DevOps API ==============
 
 async function azureRequest(url: string, pat: string): Promise<unknown> {
@@ -189,8 +275,14 @@ async function processJob(
     const chunks = chunkArray(workItems, CHUNK_SIZE);
     const allChunkResults: ChunkResult[] = [];
     let processedChunks = 0;
-    let totalPRsProcessed = 0;
-    let totalCommentsProcessed = 0;
+
+    // Aggregated telemetry counters for entire job (logged at end)
+    let jobTotalPRs = 0;
+    let jobTotalComments = 0;
+    let jobTotalCommentsFetched = 0;
+    let jobTotalCommentsAggregated = 0;
+    let jobTotalApiCalls = 0;
+    const jobUniqueAuthors = new Set<string>();
 
     // Process chunks in parallel batches with concurrency limit
     for (let i = 0; i < chunks.length; i += CHUNK_CONCURRENCY) {
@@ -220,16 +312,15 @@ async function processJob(
       // Aggregate chunk stats for telemetry - EXTENDED counters
       let batchCommentsFetched = 0;
       let batchCommentsAggregated = 0;
-      let batchUniqueAuthors = new Set<string>();
       let batchApiCalls = 0;
       let maxChunkSize = 0;
       let maxCommentsInChunk = 0;
+      let batchPRs = 0;
+      let batchComments = 0;
 
       for (const result of batchResults) {
-        totalPRsProcessed += result.prStats?.prs || 0;
-        totalCommentsProcessed += result.prStats?.comments || 0;
-        
-        // Extended telemetry counters
+        batchPRs += result.prStats?.prs || 0;
+        batchComments += result.prStats?.comments || 0;
         batchCommentsFetched += result.prStats?.commentsFetched || 0;
         batchCommentsAggregated += result.prStats?.commentsAggregated || 0;
         batchApiCalls += result.prStats?.apiCalls || 0;
@@ -243,15 +334,22 @@ async function processJob(
         
         // Collect unique authors from PR aggregates
         for (const author of Object.keys(result.prAgg)) {
-          batchUniqueAuthors.add(author);
+          jobUniqueAuthors.add(author);
         }
       }
 
-      chunkProcessStage.counts.prsProcessed = totalPRsProcessed;
-      chunkProcessStage.counts.commentsProcessed = totalCommentsProcessed;
+      // Update job-level totals
+      jobTotalPRs += batchPRs;
+      jobTotalComments += batchComments;
+      jobTotalCommentsFetched += batchCommentsFetched;
+      jobTotalCommentsAggregated += batchCommentsAggregated;
+      jobTotalApiCalls += batchApiCalls;
+
+      chunkProcessStage.counts.prsProcessed = batchPRs;
+      chunkProcessStage.counts.commentsProcessed = batchComments;
       chunkProcessStage.counts.commentsFetched = batchCommentsFetched;
       chunkProcessStage.counts.commentsAggregated = batchCommentsAggregated;
-      chunkProcessStage.counts.uniqueCommentAuthors = batchUniqueAuthors.size;
+      chunkProcessStage.counts.apiCalls = batchApiCalls;
       logStageTelemetry(chunkProcessStage);
       
       // Memory-safety telemetry (cheap, always log)
@@ -264,7 +362,7 @@ async function processJob(
         chunksInBatch: chunkBatch.length,
       })}`);
 
-      // Save chunk results to database for recovery - with error handling
+      // Save chunk results to database for recovery - with explicit error handling
       const persistStage = startStage(jobId, 'persist_chunks');
       for (let j = 0; j < batchResults.length; j++) {
         const chunkData = {
@@ -284,6 +382,18 @@ async function processJob(
       persistStage.counts = { chunksStored: batchResults.length };
       logStageTelemetry(persistStage);
     }
+
+    // Log final job-level PR telemetry summary
+    console.log(`[Telemetry] ${JSON.stringify({
+      jobId,
+      stage: 'pr_processing_summary',
+      totalPRs: jobTotalPRs,
+      totalComments: jobTotalComments,
+      commentsFetched: jobTotalCommentsFetched,
+      commentsAggregated: jobTotalCommentsAggregated,
+      uniqueAuthors: jobUniqueAuthors.size,
+      totalApiCalls: jobTotalApiCalls,
+    })}`);
 
     // Stage 3: Merge all results (numeric summation only)
     const mergeStage = startStage(jobId, 'merge_chunks');
@@ -549,11 +659,11 @@ function extractAssignedToHistory(revisions: WorkItemRevision[]): string[] {
 }
 
 // Developer attribution: current AssignedTo -> fallback to last known -> Unassigned
-function getCurrentAssignedTo(wi: WorkItem, history: string[]): string {
+function getCurrentAssignedTo(wi: WorkItem, history: string[]): { name: string; fallbackUsed: boolean } {
   const current = getDisplayName(wi.fields['System.AssignedTo']);
-  if (current) return current;
-  if (history.length > 0) return history[history.length - 1];
-  return 'Unassigned';
+  if (current) return { name: current, fallbackUsed: false };
+  if (history.length > 0) return { name: history[history.length - 1], fallbackUsed: true };
+  return { name: 'Unassigned', fallbackUsed: true };
 }
 
 function extractTransitions(revisions: WorkItemRevision[], workItemId: number): TransitionEvent[] {
@@ -579,24 +689,29 @@ interface ActivePeriod {
   start: Date;
   end: Date | null;
   durationHours: number;
+  included: boolean;
+  exclusionReason?: string;
 }
 
-function calculateDevelopmentTime(transitions: TransitionEvent[]): { totalHours: number; cycles: number; activePeriods: ActivePeriod[] } {
+function calculateDevelopmentTime(transitions: TransitionEvent[]): { totalHours: number; cycles: number; activePeriods: ActivePeriod[]; stoppedAtFirstDevAcceptance: boolean } {
   let totalHours = 0;
   let cycles = 0;
   let activeStart: Date | null = null;
   const activePeriods: ActivePeriod[] = [];
+  let stoppedAtFirstDevAcceptance = false;
 
   for (const t of transitions) {
+    // Stop counting at first DEV_Acceptance Testing transition (business rule)
     if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
       if (activeStart) {
         const duration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
         totalHours += duration;
         cycles++;
-        activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration });
+        activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration, included: true });
         activeStart = null;
       }
-      return { totalHours, cycles, activePeriods };
+      stoppedAtFirstDevAcceptance = true;
+      return { totalHours, cycles, activePeriods, stoppedAtFirstDevAcceptance };
     }
     if (t.toState === STATES.ACTIVE) {
       activeStart = t.timestamp;
@@ -604,23 +719,24 @@ function calculateDevelopmentTime(transitions: TransitionEvent[]): { totalHours:
       const duration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
       totalHours += duration;
       cycles++;
-      activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration });
+      activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration, included: true });
       activeStart = null;
     }
   }
   
   // Handle case where still in Active state
   if (activeStart) {
-    activePeriods.push({ start: activeStart, end: null, durationHours: 0 });
+    activePeriods.push({ start: activeStart, end: null, durationHours: 0, included: false, exclusionReason: 'Still in Active state' });
   }
   
-  return { totalHours, cycles, activePeriods };
+  return { totalHours, cycles, activePeriods, stoppedAtFirstDevAcceptance };
 }
 
 interface FixRequiredReturn {
   sourceState: string;
   timestamp: Date;
   changedBy: string | null;
+  category: 'codeReview' | 'devTesting' | 'stgTesting' | 'other';
 }
 
 function countReturns(transitions: TransitionEvent[]): { cr: number; dev: number; stg: number; returns: FixRequiredReturn[] } {
@@ -629,14 +745,23 @@ function countReturns(transitions: TransitionEvent[]): { cr: number; dev: number
   
   for (const t of transitions) {
     if (t.toState === STATES.FIX_REQUIRED) {
+      let category: 'codeReview' | 'devTesting' | 'stgTesting' | 'other' = 'other';
+      if (t.fromState === STATES.CODE_REVIEW) {
+        cr++;
+        category = 'codeReview';
+      } else if (t.fromState === STATES.DEV_IN_TESTING || t.fromState === STATES.DEV_ACCEPTANCE_TESTING) {
+        dev++;
+        category = 'devTesting';
+      } else if (t.fromState === STATES.STG_IN_TESTING || t.fromState === STATES.STG_ACCEPTANCE_TESTING) {
+        stg++;
+        category = 'stgTesting';
+      }
       returns.push({
         sourceState: t.fromState,
         timestamp: t.timestamp,
         changedBy: t.changedBy,
+        category,
       });
-      if (t.fromState === STATES.CODE_REVIEW) cr++;
-      else if (t.fromState === STATES.DEV_IN_TESTING || t.fromState === STATES.DEV_ACCEPTANCE_TESTING) dev++;
-      else if (t.fromState === STATES.STG_IN_TESTING || t.fromState === STATES.STG_ACCEPTANCE_TESTING) stg++;
     }
   }
   return { cr, dev, stg, returns };
@@ -644,8 +769,11 @@ function countReturns(transitions: TransitionEvent[]): { cr: number; dev: number
 
 interface TestingCycleDetail {
   tester: string;
+  cycleNumber: number;
   periods: Array<{ start: Date; end: Date; durationHours: number }>;
   merged: boolean;
+  mergeReason?: string;
+  iterationsCounted: number;
   closingStatus: string;
 }
 
@@ -656,7 +784,8 @@ function calculateTestingMetricsWithDetails(
 ): { metrics: Map<string, { hours: number; cycles: number; iterations: number }>; cycles: TestingCycleDetail[] } {
   const metrics = new Map<string, { hours: number; cycles: number; iterations: number }>();
   const cycles: TestingCycleDetail[] = [];
-  let cycle: { tester: string; start: Date; periods: Array<{ start: Date; end: Date; durationHours: number }>; pendingMerge: boolean; lastState: string } | null = null;
+  let cycle: { tester: string; start: Date; periods: Array<{ start: Date; end: Date; durationHours: number }>; pendingMerge: boolean; lastState: string; cycleNumber: number } | null = null;
+  let cycleCounter = 0;
 
   for (let i = 0; i < transitions.length; i++) {
     const t = transitions[i];
@@ -665,6 +794,7 @@ function calculateTestingMetricsWithDetails(
       const tester = t.changedBy || t.assignedTo || 'Unknown';
 
       if (cycle?.pendingMerge && t.fromState === acceptanceState && cycle.tester === tester) {
+        // Merge: same tester moving back from acceptance to testing
         cycle.pendingMerge = false;
       } else {
         if (cycle) {
@@ -674,9 +804,18 @@ function calculateTestingMetricsWithDetails(
           m.hours += hours;
           m.cycles++;
           m.iterations++;
-          cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: cycle.pendingMerge, closingStatus: cycle.lastState });
+          cycles.push({ 
+            tester: cycle.tester, 
+            cycleNumber: cycle.cycleNumber,
+            periods: cycle.periods, 
+            merged: cycle.pendingMerge, 
+            mergeReason: cycle.pendingMerge ? 'Pending merge not completed' : undefined,
+            iterationsCounted: 1,
+            closingStatus: cycle.lastState 
+          });
         }
-        cycle = { tester, start: t.timestamp, periods: [], pendingMerge: false, lastState: inTestingState };
+        cycleCounter++;
+        cycle = { tester, start: t.timestamp, periods: [], pendingMerge: false, lastState: inTestingState, cycleNumber: cycleCounter };
       }
     } else if (t.fromState === inTestingState && cycle) {
       const durationHours = (t.timestamp.getTime() - cycle.start.getTime()) / 3600000;
@@ -704,7 +843,14 @@ function calculateTestingMetricsWithDetails(
           m.hours += totalHours;
           m.cycles++;
           m.iterations++;
-          cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: false, closingStatus: t.toState });
+          cycles.push({ 
+            tester: cycle.tester, 
+            cycleNumber: cycle.cycleNumber,
+            periods: cycle.periods, 
+            merged: false, 
+            iterationsCounted: 1,
+            closingStatus: t.toState 
+          });
           cycle = null;
         }
       } else {
@@ -714,7 +860,14 @@ function calculateTestingMetricsWithDetails(
         m.hours += totalHours;
         m.cycles++;
         m.iterations++;
-        cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: false, closingStatus: t.toState });
+        cycles.push({ 
+          tester: cycle.tester, 
+          cycleNumber: cycle.cycleNumber,
+          periods: cycle.periods, 
+          merged: false, 
+          iterationsCounted: 1,
+          closingStatus: t.toState 
+        });
         cycle = null;
       }
     } else if (cycle?.pendingMerge && t.fromState === acceptanceState && t.toState !== inTestingState) {
@@ -724,7 +877,15 @@ function calculateTestingMetricsWithDetails(
       m.hours += totalHours;
       m.cycles++;
       m.iterations++;
-      cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: true, closingStatus: t.toState });
+      cycles.push({ 
+        tester: cycle.tester, 
+        cycleNumber: cycle.cycleNumber,
+        periods: cycle.periods, 
+        merged: true, 
+        mergeReason: 'Same tester In Testing → Acceptance → In Testing merged',
+        iterationsCounted: 1,
+        closingStatus: t.toState 
+      });
       cycle = null;
     }
   }
@@ -735,7 +896,15 @@ function calculateTestingMetricsWithDetails(
     const m = metrics.get(cycle.tester)!;
     m.hours += totalHours;
     m.cycles++;
-    cycles.push({ tester: cycle.tester, periods: cycle.periods, merged: cycle.pendingMerge, closingStatus: 'In Progress' });
+    cycles.push({ 
+      tester: cycle.tester, 
+      cycleNumber: cycle.cycleNumber,
+      periods: cycle.periods, 
+      merged: cycle.pendingMerge, 
+      mergeReason: cycle.pendingMerge ? 'Cycle ended with pending merge' : undefined,
+      iterationsCounted: 1,
+      closingStatus: 'In Progress' 
+    });
   }
 
   return { metrics, cycles };
@@ -789,7 +958,7 @@ async function processWorkItemChunkWithPRs(
       const history = extractAssignedToHistory(revisions);
       
       // Developer attribution: strictly by current AssignedTo with fallbacks
-      const assignedTo = getCurrentAssignedTo(wi, history);
+      const { name: assignedTo, fallbackUsed } = getCurrentAssignedTo(wi, history);
       const url = `https://dev.azure.com/${org}/${project}/_workitems/edit/${wi.id}`;
 
       const ref: WorkItemReference = { id: wi.id, title, type, url, count: 0, assignedToChanged: history.length > 1, assignedToHistory: history };
@@ -829,7 +998,9 @@ async function processWorkItemChunkWithPRs(
 
       // DEV Testing with details for debug
       const devTestResult = calculateTestingMetricsWithDetails(transitions, STATES.DEV_IN_TESTING, STATES.DEV_ACCEPTANCE_TESTING);
+      const attributedDevTesters: string[] = [];
       for (const [tester, data] of devTestResult.metrics) {
+        attributedDevTesters.push(tester);
         if (!testerAgg[tester]) {
           testerAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
         }
@@ -852,7 +1023,9 @@ async function processWorkItemChunkWithPRs(
 
       // STG Testing with details for debug
       const stgTestResult = calculateTestingMetricsWithDetails(transitions, STATES.STG_IN_TESTING, STATES.STG_ACCEPTANCE_TESTING);
+      const attributedStgTesters: string[] = [];
       for (const [tester, data] of stgTestResult.metrics) {
+        attributedStgTesters.push(tester);
         if (!testerAgg[tester]) {
           testerAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
         }
@@ -873,8 +1046,91 @@ async function processWorkItemChunkWithPRs(
         }
       }
 
-      // VERBOSE debug logging per work item (only for small queries)
+      // VERBOSE DOMAIN DEBUG: Emit structured log per work item (only for small queries ≤20)
       if (isVerbose) {
+        const domainLog: DomainDebugLog = {
+          workItemId: wi.id,
+          title,
+          type,
+          currentState: state,
+          attribution: {
+            currentAssignedTo: assignedTo,
+            fallbackUsed,
+            assignedToHistory: history,
+          },
+          stateTransitions: transitions.map(t => ({
+            fromState: t.fromState,
+            toState: t.toState,
+            enteredAt: t.timestamp.toISOString(),
+            leftAt: t.timestamp.toISOString(), // Same as enteredAt for transition event
+            durationHours: 0, // Transitions are point-in-time
+            changedBy: t.changedBy,
+            assignedToAtTransition: t.assignedTo,
+          })),
+          developmentTime: {
+            activePeriods: devTime.activePeriods.map(p => ({
+              start: p.start.toISOString(),
+              end: p.end?.toISOString() || null,
+              durationHours: Math.round(p.durationHours * 1000) / 1000,
+              included: p.included,
+              exclusionReason: p.exclusionReason,
+            })),
+            totalActiveHours: Math.round(devTime.totalHours * 1000) / 1000,
+            developmentCycles: devTime.cycles,
+            stoppedAtFirstDevAcceptance: devTime.stoppedAtFirstDevAcceptance,
+          },
+          testingCycles: {
+            dev: devTestResult.cycles.map(c => ({
+              tester: c.tester,
+              cycleNumber: c.cycleNumber,
+              periods: c.periods.map(p => ({
+                start: p.start.toISOString(),
+                end: p.end.toISOString(),
+                durationHours: Math.round(p.durationHours * 1000) / 1000,
+              })),
+              merged: c.merged,
+              mergeReason: c.mergeReason,
+              iterationsCounted: c.iterationsCounted,
+              closingStatus: c.closingStatus,
+            })),
+            stg: stgTestResult.cycles.map(c => ({
+              tester: c.tester,
+              cycleNumber: c.cycleNumber,
+              periods: c.periods.map(p => ({
+                start: p.start.toISOString(),
+                end: p.end.toISOString(),
+                durationHours: Math.round(p.durationHours * 1000) / 1000,
+              })),
+              merged: c.merged,
+              mergeReason: c.mergeReason,
+              iterationsCounted: c.iterationsCounted,
+              closingStatus: c.closingStatus,
+            })),
+          },
+          fixRequiredReturns: returnsData.returns.map(r => ({
+            sourceState: r.sourceState,
+            timestamp: r.timestamp.toISOString(),
+            changedBy: r.changedBy,
+            category: r.category,
+            attributedTo: assignedTo,
+          })),
+          finalContribution: {
+            devActiveTimeHours: Math.round(devTime.totalHours * 1000) / 1000,
+            devTestTimeHours: Math.round([...devTestResult.metrics.values()].reduce((s, d) => s + d.hours, 0) * 1000) / 1000,
+            stgTestTimeHours: Math.round([...stgTestResult.metrics.values()].reduce((s, d) => s + d.hours, 0) * 1000) / 1000,
+            codeReviewReturns: returnsData.cr,
+            devTestingReturns: returnsData.dev,
+            stgTestingReturns: returnsData.stg,
+            totalReturns: totalRet,
+            itemCompleted: state === STATES.RELEASED,
+            attributedDeveloper: assignedTo,
+            attributedTesters: [...new Set([...attributedDevTesters, ...attributedStgTesters])],
+          },
+        };
+        
+        emitDomainDebugLog(domainLog, jobId);
+
+        // Also store in debugLogs for response (legacy format)
         debugLogs.workItems[wi.id] = {
           workItemId: wi.id,
           title,
@@ -976,21 +1232,19 @@ async function processPRCommentsForChunk(
   let totalCommentsAggregated = 0;
   let totalApiCalls = 0;
   const allAuthors = new Set<string>();
-  const PR_BATCH_SIZE = 15;
 
-  // Stage telemetry for PR fetching
-  const prFetchStage: StageTelemetry = {
-    jobId,
-    stage: 'fetch_pr_comments',
-    startTime: Date.now(),
-    counts: {},
-  };
+  // Stage-level telemetry for PR fetching
+  const prFetchStage = startStage(jobId, 'fetch_pr_comments');
 
-  for (let i = 0; i < workItems.length; i += PR_BATCH_SIZE) {
-    const batch = workItems.slice(i, i + PR_BATCH_SIZE);
-    const results = await Promise.all(batch.map(wi => getPRCommentsForItem(org, project, wi, pat, isVerbose, debugLogs)));
+  // Process work items in small batches for PR comments
+  const PR_BATCH = 15;
+  for (let i = 0; i < workItems.length; i += PR_BATCH) {
+    const batch = workItems.slice(i, i + PR_BATCH);
+    const prResults = await Promise.all(
+      batch.map(wi => getPRCommentsForItem(org, project, wi, pat, isVerbose, debugLogs))
+    );
 
-    for (const result of results) {
+    for (const result of prResults) {
       totalPRs += result.prCount;
       totalComments += result.commentCount;
       totalCommentsFetched += result.commentsFetched;
