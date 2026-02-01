@@ -51,49 +51,61 @@ export type Database = {
       }
       analysis_jobs: {
         Row: {
+          completed_chunks: number | null
           created_at: string
           current_step: string | null
           error_message: string | null
           expires_at: string
           id: string
+          last_progress_at: string | null
           organization: string
           processed_items: number | null
           project: string
           query_id: string
           result: Json | null
           status: string
+          total_chunks: number | null
           total_items: number | null
           updated_at: string
+          work_item_ids: Json | null
         }
         Insert: {
+          completed_chunks?: number | null
           created_at?: string
           current_step?: string | null
           error_message?: string | null
           expires_at?: string
           id?: string
+          last_progress_at?: string | null
           organization: string
           processed_items?: number | null
           project: string
           query_id: string
           result?: Json | null
           status?: string
+          total_chunks?: number | null
           total_items?: number | null
           updated_at?: string
+          work_item_ids?: Json | null
         }
         Update: {
+          completed_chunks?: number | null
           created_at?: string
           current_step?: string | null
           error_message?: string | null
           expires_at?: string
           id?: string
+          last_progress_at?: string | null
           organization?: string
           processed_items?: number | null
           project?: string
           query_id?: string
           result?: Json | null
           status?: string
+          total_chunks?: number | null
           total_items?: number | null
           updated_at?: string
+          work_item_ids?: Json | null
         }
         Relationships: []
       }
