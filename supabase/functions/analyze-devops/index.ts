@@ -10,7 +10,8 @@ const corsHeaders = {
 const CHUNK_SIZE = 50; // Work items per chunk
 const CHUNK_CONCURRENCY = 4; // Parallel chunk processing limit
 const DEBUG_THRESHOLD = 20; // Auto-enable verbose debug for <= 20 items
-const MAX_BATCH_TIME_MS = 50000; // Max time per waitUntil batch (~50s, leaving buffer for EdgeRuntime limit)
+const MAX_BATCH_TIME_MS = 45000; // Max time per batch (~45s to leave buffer before CPU limit)
+const STALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes - mark job failed if no progress
 
 interface AnalysisRequest {
   organization: string;
@@ -19,12 +20,8 @@ interface AnalysisRequest {
   pat: string;
   debug?: boolean;
   // Internal fields for continuation
-  _internal?: {
+  _continuation?: {
     jobId: string;
-    nextChunkIndex: number;
-    totalChunks: number;
-    workItemIds: number[];
-    debugMode: 'verbose' | 'aggregated' | 'none';
   };
 }
 
@@ -175,40 +172,36 @@ serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+  const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
   try {
     const request = await req.json() as AnalysisRequest;
-    const { organization, project, queryId, pat, debug: requestDebug = false, _internal } = request;
+    const { organization, project, queryId, pat, debug: requestDebug = false, _continuation } = request;
 
-    // Initialize Supabase client with service role for database operations
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    // CONTINUATION MODE: Resume processing from a specific chunk
-    if (_internal) {
-      console.log(`[Job ${_internal.jobId}] Continuation: chunks ${_internal.nextChunkIndex}+ of ${_internal.totalChunks}`);
+    // CONTINUATION MODE: Resume processing from persisted state
+    if (_continuation) {
+      const { jobId } = _continuation;
+      console.log(`[Job ${jobId}] Continuation request received`);
       
-      // @ts-ignore - EdgeRuntime is available in Supabase Edge Functions
-      EdgeRuntime.waitUntil(
-        processContinuation(
-          supabase as any,
-          _internal.jobId,
-          organization,
-          project,
-          pat,
-          _internal.workItemIds,
-          _internal.nextChunkIndex,
-          _internal.totalChunks,
-          _internal.debugMode
-        )
-      );
-
-      return new Response(JSON.stringify({
-        jobId: _internal.jobId,
-        status: 'processing',
-        continuation: true,
-        nextChunkIndex: _internal.nextChunkIndex,
-      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      // Process synchronously (NOT in waitUntil) for better control
+      try {
+        await processContinuation(supabase as any, jobId, organization, project, pat);
+        
+        return new Response(JSON.stringify({
+          jobId,
+          status: 'continuing',
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } catch (error) {
+        console.error(`[Job ${jobId}] Continuation failed:`, error);
+        await markJobFailed(supabase as any, jobId, error instanceof Error ? error.message : 'Continuation failed');
+        return new Response(JSON.stringify({
+          jobId,
+          status: 'failed',
+          error: error instanceof Error ? error.message : 'Unknown error',
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
     }
 
     // INITIAL MODE: Start new analysis
@@ -241,7 +234,7 @@ serve(async (req) => {
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Create job record
+    // Create job record with work item IDs persisted
     const totalChunks = Math.ceil(workItemIds.length / CHUNK_SIZE);
     const { data: job, error: jobError } = await supabase
       .from('analysis_jobs')
@@ -252,6 +245,10 @@ serve(async (req) => {
         status: 'processing',
         total_items: workItemIds.length,
         processed_items: 0,
+        total_chunks: totalChunks,
+        completed_chunks: 0,
+        work_item_ids: workItemIds, // Persist for recovery
+        last_progress_at: new Date().toISOString(),
         current_step: `Starting analysis of ${workItemIds.length} items in ${totalChunks} chunks`,
       })
       .select('id')
@@ -264,11 +261,20 @@ serve(async (req) => {
     const jobId = job.id;
     console.log(`[Job ${jobId}] Created job for ${workItemIds.length} items in ${totalChunks} chunks`);
 
-    // Start first batch processing in background
-    // @ts-ignore - EdgeRuntime is available in Supabase Edge Functions
-    EdgeRuntime.waitUntil(
-      processFirstBatch(supabase as any, jobId, organization, project, pat, workItemIds, debugMode, totalChunks)
-    );
+    // Process first batch synchronously, then schedule continuation if needed
+    try {
+      const needsContinuation = await processFirstBatch(
+        supabase as any, jobId, organization, project, pat, workItemIds, debugMode, totalChunks
+      );
+      
+      if (needsContinuation) {
+        // Schedule continuation via separate HTTP request (fire and forget)
+        scheduleContinuationAsync(supabaseUrl, supabaseKey, organization, project, pat, jobId);
+      }
+    } catch (error) {
+      console.error(`[Job ${jobId}] First batch failed:`, error);
+      await markJobFailed(supabase as any, jobId, error instanceof Error ? error.message : 'Unknown error');
+    }
 
     return new Response(JSON.stringify({
       jobId,
@@ -287,7 +293,7 @@ serve(async (req) => {
   }
 });
 
-// ============== First Batch Processing (fetch work items + first chunks) ==============
+// ============== First Batch Processing ==============
 
 async function processFirstBatch(
   supabase: ReturnType<typeof createClient>,
@@ -298,82 +304,61 @@ async function processFirstBatch(
   workItemIds: number[],
   debugMode: 'verbose' | 'aggregated' | 'none',
   totalChunks: number
-) {
+): Promise<boolean> {
   const isVerbose = debugMode === 'verbose';
   const debugLogs: DebugOutput = { workItems: {}, prComments: [] };
+  const batchStartTime = Date.now();
 
-  try {
-    console.log(`[Job ${jobId}] Starting first batch [DEBUG: ${debugMode}]`);
+  console.log(`[Job ${jobId}] Starting first batch [DEBUG: ${debugMode}]`);
 
-    // Stage 1: Fetch all work items with relations (batched)
-    const fetchStage = startStage(jobId, 'fetch_work_items');
-    await updateJobStatus(supabase, jobId, 'Fetching work items...');
-    const workItems = await fetchWorkItemsBatched(organization, project, workItemIds, pat);
-    fetchStage.counts = { workItems: workItems.length };
-    logStageTelemetry(fetchStage);
-    console.log(`[Job ${jobId}] Fetched ${workItems.length} work items`);
+  // Stage 1: Fetch all work items with relations
+  const fetchStage = startStage(jobId, 'fetch_work_items');
+  await updateJobStatus(supabase, jobId, 'Fetching work items...');
+  const workItems = await fetchWorkItemsBatched(organization, project, workItemIds, pat);
+  fetchStage.counts = { workItems: workItems.length };
+  logStageTelemetry(fetchStage);
+  console.log(`[Job ${jobId}] Fetched ${workItems.length} work items`);
 
-    // Stage 2: Process first batch of chunks (up to CHUNK_CONCURRENCY chunks)
-    const chunks = chunkArray(workItems, CHUNK_SIZE);
-    const firstBatchEnd = Math.min(CHUNK_CONCURRENCY, chunks.length);
-    const batchStartTime = Date.now();
+  // Get current completed chunks from database
+  const { data: jobState } = await (supabase.from('analysis_jobs') as any)
+    .select('completed_chunks')
+    .eq('id', jobId)
+    .single();
+  
+  let currentChunkIndex = (jobState?.completed_chunks as number) || 0;
+  const chunks = chunkArray(workItems, CHUNK_SIZE);
+
+  // Process chunks until time limit or completion
+  while (currentChunkIndex < chunks.length) {
+    const elapsedMs = Date.now() - batchStartTime;
     
-    await updateJobStatus(supabase, jobId, `Processing chunks 1-${firstBatchEnd}/${totalChunks}`);
-    
-    const chunkBatch = chunks.slice(0, firstBatchEnd);
-    const chunkResults = await processChunkBatch(
-      organization, project, pat, chunkBatch, isVerbose, debugLogs, jobId, 0
-    );
-
-    // Persist chunk results atomically
-    await persistChunkResults(supabase, jobId, chunkResults, 0);
-    console.log(`[Job ${jobId}] Persisted chunks 0-${firstBatchEnd - 1}`);
-
-    // Update progress
-    const processedItems = Math.min(firstBatchEnd * CHUNK_SIZE, workItemIds.length);
-    await updateJobProgress(supabase, jobId, processedItems, firstBatchEnd, totalChunks);
-
-    // Check if we have more chunks to process
-    if (firstBatchEnd < chunks.length) {
-      // Check if we have time for another batch or need to schedule continuation
-      const elapsedMs = Date.now() - batchStartTime;
-      
-      if (elapsedMs < MAX_BATCH_TIME_MS && firstBatchEnd + CHUNK_CONCURRENCY <= chunks.length) {
-        // We have time, process next batch directly
-        console.log(`[Job ${jobId}] Processing additional batch (elapsed: ${elapsedMs}ms)`);
-        
-        const nextBatchStart = firstBatchEnd;
-        const nextBatchEnd = Math.min(nextBatchStart + CHUNK_CONCURRENCY, chunks.length);
-        const nextBatch = chunks.slice(nextBatchStart, nextBatchEnd);
-        
-        const nextResults = await processChunkBatch(
-          organization, project, pat, nextBatch, isVerbose, debugLogs, jobId, nextBatchStart
-        );
-        await persistChunkResults(supabase, jobId, nextResults, nextBatchStart);
-        
-        const newProcessedItems = Math.min(nextBatchEnd * CHUNK_SIZE, workItemIds.length);
-        await updateJobProgress(supabase, jobId, newProcessedItems, nextBatchEnd, totalChunks);
-        
-        if (nextBatchEnd < chunks.length) {
-          // Schedule continuation for remaining chunks
-          await scheduleContinuation(organization, project, pat, jobId, workItemIds, nextBatchEnd, totalChunks, debugMode);
-        } else {
-          // All chunks done, merge and complete
-          await finalizeJob(supabase, jobId, workItems, isVerbose, debugLogs);
-        }
-      } else {
-        // Schedule continuation for remaining chunks
-        await scheduleContinuation(organization, project, pat, jobId, workItemIds, firstBatchEnd, totalChunks, debugMode);
-      }
-    } else {
-      // All chunks done in first batch, merge and complete
-      await finalizeJob(supabase, jobId, workItems, isVerbose, debugLogs);
+    // Check time limit BEFORE processing next batch
+    if (elapsedMs > MAX_BATCH_TIME_MS) {
+      console.log(`[Job ${jobId}] Time limit reached (${elapsedMs}ms), will schedule continuation`);
+      return true; // Signal that continuation is needed
     }
 
-  } catch (error) {
-    console.error(`[Job ${jobId}] First batch failed:`, error);
-    await markJobFailed(supabase, jobId, error instanceof Error ? error.message : 'Unknown error');
+    const batchEnd = Math.min(currentChunkIndex + CHUNK_CONCURRENCY, chunks.length);
+    const chunkBatch = chunks.slice(currentChunkIndex, batchEnd);
+    
+    await updateJobStatus(supabase, jobId, `Processing chunks ${currentChunkIndex + 1}-${batchEnd}/${totalChunks}`);
+    
+    const results = await processChunkBatch(
+      organization, project, pat, chunkBatch, isVerbose, debugLogs, jobId, currentChunkIndex
+    );
+    
+    await persistChunkResults(supabase, jobId, results, currentChunkIndex);
+    console.log(`[Job ${jobId}] Persisted chunks ${currentChunkIndex}-${batchEnd - 1}`);
+
+    // Update progress with heartbeat
+    await updateJobProgress(supabase, jobId, Math.min(batchEnd * CHUNK_SIZE, workItemIds.length), batchEnd, totalChunks);
+
+    currentChunkIndex = batchEnd;
   }
+
+  // All chunks done, finalize
+  await finalizeJob(supabase, jobId, workItems, isVerbose, debugLogs);
+  return false; // No continuation needed
 }
 
 // ============== Continuation Processing ==============
@@ -383,63 +368,86 @@ async function processContinuation(
   jobId: string,
   organization: string,
   project: string,
-  pat: string,
-  workItemIds: number[],
-  nextChunkIndex: number,
-  totalChunks: number,
-  debugMode: 'verbose' | 'aggregated' | 'none'
+  pat: string
 ) {
-  const isVerbose = debugMode === 'verbose';
+  // Load job state from database
+  const { data: job, error: loadError } = await (supabase.from('analysis_jobs') as any)
+    .select('*')
+    .eq('id', jobId)
+    .single();
+
+  if (loadError || !job) {
+    throw new Error(`Job not found: ${loadError?.message || 'unknown'}`);
+  }
+
+  // Stall detection
+  if ((job as any).last_progress_at) {
+    const lastProgress = new Date((job as any).last_progress_at).getTime();
+    if (Date.now() - lastProgress > STALL_TIMEOUT_MS) {
+      throw new Error(`Job stalled: no progress for ${Math.round((Date.now() - lastProgress) / 60000)} minutes`);
+    }
+  }
+
+  // Check if job is already completed or failed
+  if ((job as any).status === 'completed' || (job as any).status === 'failed') {
+    console.log(`[Job ${jobId}] Already ${(job as any).status}, skipping continuation`);
+    return;
+  }
+
+  const workItemIds = (job as any).work_item_ids as number[];
+  const totalChunks = (job as any).total_chunks as number;
+  let currentChunkIndex = (job as any).completed_chunks as number;
+
+  console.log(`[Job ${jobId}] Continuation from chunk ${currentChunkIndex}/${totalChunks}`);
+
+  // Determine debug mode
+  const isVerbose = workItemIds.length <= DEBUG_THRESHOLD;
   const debugLogs: DebugOutput = { workItems: {}, prComments: [] };
 
-  try {
-    console.log(`[Job ${jobId}] Continuation from chunk ${nextChunkIndex}`);
-    const batchStartTime = Date.now();
+  const batchStartTime = Date.now();
 
-    // Re-fetch work items (needed for chunk processing)
-    const fetchStage = startStage(jobId, 'fetch_work_items_continuation');
-    const workItems = await fetchWorkItemsBatched(organization, project, workItemIds, pat);
-    fetchStage.counts = { workItems: workItems.length };
-    logStageTelemetry(fetchStage);
+  // Re-fetch work items
+  const fetchStage = startStage(jobId, 'fetch_work_items_continuation');
+  const workItems = await fetchWorkItemsBatched(organization, project, workItemIds, pat);
+  fetchStage.counts = { workItems: workItems.length };
+  logStageTelemetry(fetchStage);
 
-    const chunks = chunkArray(workItems, CHUNK_SIZE);
-    let currentChunkIndex = nextChunkIndex;
+  const chunks = chunkArray(workItems, CHUNK_SIZE);
 
-    // Process batches until time limit or completion
-    while (currentChunkIndex < chunks.length) {
-      const batchEnd = Math.min(currentChunkIndex + CHUNK_CONCURRENCY, chunks.length);
-      const chunkBatch = chunks.slice(currentChunkIndex, batchEnd);
+  // Process remaining chunks
+  while (currentChunkIndex < chunks.length) {
+    const elapsedMs = Date.now() - batchStartTime;
+    
+    // Check time limit BEFORE processing
+    if (elapsedMs > MAX_BATCH_TIME_MS) {
+      console.log(`[Job ${jobId}] Time limit reached (${elapsedMs}ms), scheduling next continuation`);
       
-      await updateJobStatus(supabase, jobId, `Processing chunks ${currentChunkIndex + 1}-${batchEnd}/${totalChunks}`);
-      
-      const results = await processChunkBatch(
-        organization, project, pat, chunkBatch, isVerbose, debugLogs, jobId, currentChunkIndex
-      );
-      
-      await persistChunkResults(supabase, jobId, results, currentChunkIndex);
-      console.log(`[Job ${jobId}] Persisted chunks ${currentChunkIndex}-${batchEnd - 1}`);
-
-      const processedItems = Math.min(batchEnd * CHUNK_SIZE, workItemIds.length);
-      await updateJobProgress(supabase, jobId, processedItems, batchEnd, totalChunks);
-
-      currentChunkIndex = batchEnd;
-
-      // Check if we need to schedule another continuation
-      const elapsedMs = Date.now() - batchStartTime;
-      if (elapsedMs > MAX_BATCH_TIME_MS && currentChunkIndex < chunks.length) {
-        console.log(`[Job ${jobId}] Time limit reached (${elapsedMs}ms), scheduling continuation`);
-        await scheduleContinuation(organization, project, pat, jobId, workItemIds, currentChunkIndex, totalChunks, debugMode);
-        return; // Exit this continuation
-      }
+      const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+      const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+      scheduleContinuationAsync(supabaseUrl, supabaseKey, organization, project, pat, jobId);
+      return;
     }
 
-    // All chunks done, merge and complete
-    await finalizeJob(supabase, jobId, workItems, isVerbose, debugLogs);
+    const batchEnd = Math.min(currentChunkIndex + CHUNK_CONCURRENCY, chunks.length);
+    const chunkBatch = chunks.slice(currentChunkIndex, batchEnd);
+    
+    await updateJobStatus(supabase, jobId, `Processing chunks ${currentChunkIndex + 1}-${batchEnd}/${totalChunks}`);
+    
+    const results = await processChunkBatch(
+      organization, project, pat, chunkBatch, isVerbose, debugLogs, jobId, currentChunkIndex
+    );
+    
+    await persistChunkResults(supabase, jobId, results, currentChunkIndex);
+    console.log(`[Job ${jobId}] Persisted chunks ${currentChunkIndex}-${batchEnd - 1}`);
 
-  } catch (error) {
-    console.error(`[Job ${jobId}] Continuation failed:`, error);
-    await markJobFailed(supabase, jobId, error instanceof Error ? error.message : 'Unknown error');
+    // Update progress with heartbeat
+    await updateJobProgress(supabase, jobId, Math.min(batchEnd * CHUNK_SIZE, workItemIds.length), batchEnd, totalChunks);
+
+    currentChunkIndex = batchEnd;
   }
+
+  // All chunks done, finalize
+  await finalizeJob(supabase, jobId, workItems, isVerbose, debugLogs);
 }
 
 // ============== Chunk Batch Processing ==============
@@ -536,58 +544,43 @@ async function persistChunkResults(
   logStageTelemetry(persistStage);
 }
 
-// ============== Schedule Continuation ==============
+// ============== Schedule Continuation (Fire and Forget) ==============
 
-async function scheduleContinuation(
+function scheduleContinuationAsync(
+  supabaseUrl: string,
+  supabaseKey: string,
   organization: string,
   project: string,
   pat: string,
-  jobId: string,
-  workItemIds: number[],
-  nextChunkIndex: number,
-  totalChunks: number,
-  debugMode: 'verbose' | 'aggregated' | 'none'
+  jobId: string
 ) {
-  console.log(`[Job ${jobId}] Scheduling continuation from chunk ${nextChunkIndex}`);
+  console.log(`[Job ${jobId}] Scheduling continuation`);
   
-  const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-  const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-  
-  // Self-invoke the edge function with continuation parameters
   const continuationRequest = {
     organization,
     project,
-    queryId: '', // Not needed for continuation
+    queryId: '',
     pat,
-    _internal: {
-      jobId,
-      nextChunkIndex,
-      totalChunks,
-      workItemIds,
-      debugMode,
-    },
+    _continuation: { jobId },
   };
 
-  try {
-    const response = await fetch(`${supabaseUrl}/functions/v1/analyze-devops`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${supabaseKey}`,
-      },
-      body: JSON.stringify(continuationRequest),
-    });
-
+  // Fire and forget - use fetch without await
+  fetch(`${supabaseUrl}/functions/v1/analyze-devops`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${supabaseKey}`,
+    },
+    body: JSON.stringify(continuationRequest),
+  }).then(response => {
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Continuation failed: ${errorText}`);
+      console.error(`[Job ${jobId}] Continuation request failed: ${response.status}`);
+    } else {
+      console.log(`[Job ${jobId}] Continuation triggered successfully`);
     }
-
-    console.log(`[Job ${jobId}] Continuation scheduled successfully`);
-  } catch (error) {
-    console.error(`[Job ${jobId}] Failed to schedule continuation:`, error);
-    throw error;
-  }
+  }).catch(error => {
+    console.error(`[Job ${jobId}] Failed to trigger continuation:`, error);
+  });
 }
 
 // ============== Finalize Job ==============
@@ -641,6 +634,7 @@ async function finalizeJob(
       processed_items: workItems.length,
       current_step: 'Complete',
       result: finalResult,
+      last_progress_at: new Date().toISOString(),
     };
     
     const { error: updateError } = await (supabase.from('analysis_jobs') as any)
@@ -665,26 +659,41 @@ async function finalizeJob(
 // ============== Helper Functions ==============
 
 async function updateJobStatus(supabase: ReturnType<typeof createClient>, jobId: string, step: string) {
-  await (supabase.from('analysis_jobs') as any).update({ current_step: step }).eq('id', jobId);
+  await (supabase.from('analysis_jobs') as any)
+    .update({ 
+      current_step: step,
+      last_progress_at: new Date().toISOString(),
+    })
+    .eq('id', jobId);
 }
 
-async function updateJobProgress(supabase: ReturnType<typeof createClient>, jobId: string, processedItems: number, processedChunks: number, totalChunks: number) {
+async function updateJobProgress(
+  supabase: ReturnType<typeof createClient>, 
+  jobId: string, 
+  processedItems: number, 
+  processedChunks: number, 
+  totalChunks: number
+) {
   const progress = Math.round((processedChunks / totalChunks) * 100);
   await (supabase.from('analysis_jobs') as any)
     .update({ 
       processed_items: processedItems,
+      completed_chunks: processedChunks, // Persist for recovery
       current_step: `Processed ${processedChunks}/${totalChunks} chunks (${progress}%)`,
+      last_progress_at: new Date().toISOString(), // Heartbeat
     })
     .eq('id', jobId);
 }
 
 async function markJobFailed(supabase: ReturnType<typeof createClient>, jobId: string, errorMessage: string) {
   try {
+    console.log(`[Job ${jobId}] Marking as FAILED: ${errorMessage}`);
     await (supabase.from('analysis_jobs') as any)
       .update({
         status: 'failed',
         error_message: errorMessage,
         current_step: 'Failed',
+        last_progress_at: new Date().toISOString(),
       })
       .eq('id', jobId);
   } catch (updateErr) {
@@ -1435,12 +1444,12 @@ async function processWorkItemChunkWithPRs(
   };
 }
 
-// ============== PR Comments Processing Per Chunk ==============
+// ============== PR Comment Processing ==============
 
 interface PRProcessResult {
   aggregates: Record<string, { count: number; prs: PRReference[] }>;
-  stats: { 
-    prs: number; 
+  stats: {
+    prs: number;
     comments: number;
     commentsFetched: number;
     commentsAggregated: number;
@@ -1466,24 +1475,23 @@ async function processPRCommentsForChunk(
   let totalApiCalls = 0;
   const allAuthors = new Set<string>();
 
-  // Stage-level telemetry for PR fetching
   const prFetchStage = startStage(jobId, 'fetch_pr_comments');
 
-  // Process work items in small batches for PR comments
+  // Process work items in smaller parallel batches to avoid API rate limits
   const PR_BATCH = 15;
   for (let i = 0; i < workItems.length; i += PR_BATCH) {
     const batch = workItems.slice(i, i + PR_BATCH);
-    const prResults = await Promise.all(
+    const results = await Promise.all(
       batch.map(wi => getPRCommentsForItem(org, project, wi, pat, isVerbose, debugLogs))
     );
 
-    for (const result of prResults) {
+    for (const result of results) {
       totalPRs += result.prCount;
       totalComments += result.commentCount;
       totalCommentsFetched += result.commentsFetched;
       totalCommentsAggregated += result.commentsAggregated;
       totalApiCalls += result.apiCalls;
-      
+
       for (const [author, data] of Object.entries(result.aggregates)) {
         allAuthors.add(author);
         if (!prAgg[author]) prAgg[author] = { count: 0, prs: [] };
@@ -1493,7 +1501,6 @@ async function processPRCommentsForChunk(
     }
   }
 
-  // Log stage telemetry for PR fetching (aggregate only)
   prFetchStage.counts = {
     prsFetched: totalPRs,
     apiCalls: totalApiCalls,
