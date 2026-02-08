@@ -30,7 +30,8 @@ type SortField =
   | 'avgDevIterationsPerTask'
   | 'avgStgIterationsPerTask'
   | 'prCommentsCount'
-  | 'avgPrCommentsPerPr';
+  | 'avgPrCommentsPerPr'
+  | 'avgOriginalEstimate';
 
 type SortDirection = 'asc' | 'desc';
 
@@ -139,7 +140,7 @@ export function TesterMetricsTable({ metrics, organization, project }: TesterMet
     value, 
     items, 
     title, 
-    className = "" 
+    className = ""
   }: { 
     value: number; 
     items: WorkItemReference[]; 
@@ -254,6 +255,7 @@ export function TesterMetricsTable({ metrics, organization, project }: TesterMet
             <tr>
               <SortableHeader field="tester">{t('tester')}</SortableHeader>
               <SortableHeader field="closedItemsCount">{t('closedItems')}</SortableHeader>
+              <SortableHeader field="avgOriginalEstimate">{t('avgOriginalEstimate')}</SortableHeader>
               <SortableHeader field="avgDevTestTimeHours">{t('avgDevTestTimeShort')}</SortableHeader>
               <SortableHeader field="avgStgTestTimeHours">{t('avgStgTestTimeShort')}</SortableHeader>
               <SortableHeader field="devTestingIterations">{t('devIterations')}</SortableHeader>
@@ -275,6 +277,11 @@ export function TesterMetricsTable({ metrics, organization, project }: TesterMet
                     title={`${metric.tester} - ${t('closedItems')}`}
                     className="badge-success"
                   />
+                </td>
+                <td>
+                  {metric.itemsWithEstimate > 0 
+                    ? `${formatNumber(metric.avgOriginalEstimate, 1)} SP` 
+                    : '—'}
                 </td>
                 <td>{formatDuration(metric.avgDevTestTimeHours)}</td>
                 <td>{formatDuration(metric.avgStgTestTimeHours)}</td>
@@ -317,6 +324,7 @@ export function TesterMetricsTable({ metrics, organization, project }: TesterMet
         items={drillDownItems}
         organization={organization}
         project={project}
+        showTimeColumns={true}
       />
       
       <PRDrillDownModal

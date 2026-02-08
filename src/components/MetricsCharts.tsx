@@ -15,12 +15,19 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
-import type { AnalysisResult, PRChartDataPoint } from "@/types/metrics";
+import { Button } from "@/components/ui/button";
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
+import { AnalysisFiltersPanel } from "./AnalysisFilters";
+import type { AnalysisResult, PRChartDataPoint, AnalysisFilters } from "@/types/metrics";
 import { t } from "@/lib/i18n";
 import { formatDuration } from "@/lib/formatters";
+import { Maximize2, Minimize2 } from "lucide-react";
 
 interface MetricsChartsProps {
   chartData: AnalysisResult["chartData"];
+  filters?: AnalysisFilters;
+  onFiltersChange?: (filters: AnalysisFilters) => void;
+  availableStates?: string[];
 }
 
 const COLORS = [
@@ -30,6 +37,10 @@ const COLORS = [
   "hsl(280, 65%, 60%)",
   "hsl(0, 72%, 51%)",
   "hsl(199, 89%, 48%)",
+  "hsl(25, 95%, 53%)",
+  "hsl(175, 80%, 40%)",
+  "hsl(320, 70%, 50%)",
+  "hsl(60, 80%, 45%)",
 ];
 
 // Custom tooltip to format hours
@@ -61,8 +72,110 @@ const CountTooltip = ({ active, payload, label }: any) => {
   return null;
 };
 
-export function MetricsCharts({ chartData }: MetricsChartsProps) {
+// Horizontal scrollable bar chart for many entries
+function ScrollableBarChart({ 
+  data, 
+  title, 
+  fill, 
+  tooltipType = 'count',
+  isFullscreen = false,
+}: { 
+  data: { name: string; value: number }[]; 
+  title: string; 
+  fill: string;
+  tooltipType?: 'hours' | 'count';
+  isFullscreen?: boolean;
+}) {
+  const [fullscreen, setFullscreen] = useState(isFullscreen);
+  
+  // Calculate width based on data size - ensure minimum visibility
+  const barWidth = 50;
+  const minWidth = 400;
+  const chartWidth = Math.max(data.length * barWidth, minWidth);
+  const chartHeight = fullscreen ? 500 : 300;
+
+  return (
+    <Card className={fullscreen ? "fixed inset-4 z-50 overflow-auto" : ""}>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-lg">{title}</CardTitle>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setFullscreen(!fullscreen)}
+          className="h-8 w-8 p-0"
+        >
+          {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+        </Button>
+      </CardHeader>
+      <CardContent>
+        {data.length === 0 ? (
+          <div className="h-[300px] flex items-center justify-center text-muted-foreground">
+            Нет данных
+          </div>
+        ) : data.length <= 8 ? (
+          // For small datasets, use responsive container
+          <div style={{ height: chartHeight }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={data} layout="horizontal">
+                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                <XAxis 
+                  dataKey="name" 
+                  stroke="hsl(var(--muted-foreground))"
+                  tick={{ fontSize: 11 }}
+                  angle={-45}
+                  textAnchor="end"
+                  height={70}
+                />
+                <YAxis 
+                  stroke="hsl(var(--muted-foreground))"
+                  tickFormatter={tooltipType === 'hours' ? (v) => formatDuration(v) : undefined}
+                />
+                <Tooltip content={tooltipType === 'hours' ? <HoursTooltip /> : <CountTooltip />} />
+                <Bar dataKey="value" fill={fill} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        ) : (
+          // For large datasets, use horizontal scroll
+          <ScrollArea className="w-full whitespace-nowrap rounded-md">
+            <div style={{ width: chartWidth, height: chartHeight }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={data} layout="horizontal">
+                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                  <XAxis 
+                    dataKey="name" 
+                    stroke="hsl(var(--muted-foreground))"
+                    tick={{ fontSize: 10 }}
+                    angle={-45}
+                    textAnchor="end"
+                    height={80}
+                    interval={0}
+                  />
+                  <YAxis 
+                    stroke="hsl(var(--muted-foreground))"
+                    tickFormatter={tooltipType === 'hours' ? (v) => formatDuration(v) : undefined}
+                  />
+                  <Tooltip content={tooltipType === 'hours' ? <HoursTooltip /> : <CountTooltip />} />
+                  <Bar dataKey="value" fill={fill} radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <ScrollBar orientation="horizontal" />
+          </ScrollArea>
+        )}
+        {data.length > 8 && (
+          <p className="text-xs text-muted-foreground mt-2 text-center">
+            Прокрутите вправо для просмотра всех {data.length} элементов
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+export function MetricsCharts({ chartData, filters, onFiltersChange, availableStates = [] }: MetricsChartsProps) {
   const [showTestersOnly, setShowTestersOnly] = useState(false);
+  const [prFullscreen, setPrFullscreen] = useState(false);
 
   // Filter PR comments based on toggle
   const filteredPrComments = showTestersOnly
@@ -70,197 +183,108 @@ export function MetricsCharts({ chartData }: MetricsChartsProps) {
     : chartData.prComments;
 
   return (
-    <div className="grid gap-6 md:grid-cols-2 animate-fade-in">
-      {/* Development Time Chart - Horizontal Bar */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">{t('avgDevTimeChart')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.developmentSpeed} layout="horizontal">
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis 
-                  dataKey="name" 
-                  stroke="hsl(var(--muted-foreground))"
-                  tick={{ fontSize: 11 }}
-                  angle={-45}
-                  textAnchor="end"
-                  height={70}
-                />
-                <YAxis 
-                  stroke="hsl(var(--muted-foreground))"
-                  tickFormatter={(v) => formatDuration(v)}
-                />
-                <Tooltip content={<HoursTooltip />} />
-                <Bar dataKey="value" fill="hsl(211, 100%, 45%)" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+    <div className="space-y-6 animate-fade-in">
+      {/* Filters at the top of charts page */}
+      {filters && onFiltersChange && (
+        <div className="flex items-center justify-between bg-card p-4 rounded-lg border">
+          <span className="text-sm font-medium">{t('activeFilters')}:</span>
+          <AnalysisFiltersPanel 
+            filters={filters} 
+            onFiltersChange={onFiltersChange}
+            availableStates={availableStates}
+          />
+        </div>
+      )}
 
-      {/* DEV Testing Time Chart - Horizontal Bar */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">{t('avgDevTestTimeChart')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.devTestingSpeed} layout="horizontal">
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis 
-                  dataKey="name" 
-                  stroke="hsl(var(--muted-foreground))"
-                  tick={{ fontSize: 11 }}
-                  angle={-45}
-                  textAnchor="end"
-                  height={70}
-                />
-                <YAxis 
-                  stroke="hsl(var(--muted-foreground))"
-                  tickFormatter={(v) => formatDuration(v)}
-                />
-                <Tooltip content={<HoursTooltip />} />
-                <Bar dataKey="value" fill="hsl(142, 71%, 45%)" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+      <div className="grid gap-6 md:grid-cols-2">
+        {/* Development Time Chart */}
+        <ScrollableBarChart
+          data={chartData.developmentSpeed}
+          title={t('avgDevTimeChart')}
+          fill="hsl(211, 100%, 45%)"
+          tooltipType="hours"
+        />
 
-      {/* STG Testing Time Chart - Horizontal Bar */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">{t('avgStgTestTimeChart')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.stgTestingSpeed} layout="horizontal">
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis 
-                  dataKey="name" 
-                  stroke="hsl(var(--muted-foreground))"
-                  tick={{ fontSize: 11 }}
-                  angle={-45}
-                  textAnchor="end"
-                  height={70}
-                />
-                <YAxis 
-                  stroke="hsl(var(--muted-foreground))"
-                  tickFormatter={(v) => formatDuration(v)}
-                />
-                <Tooltip content={<HoursTooltip />} />
-                <Bar dataKey="value" fill="hsl(38, 92%, 50%)" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+        {/* DEV Testing Time Chart */}
+        <ScrollableBarChart
+          data={chartData.devTestingSpeed}
+          title={t('avgDevTestTimeChart')}
+          fill="hsl(142, 71%, 45%)"
+          tooltipType="hours"
+        />
 
-      {/* Returns Chart - Horizontal Bar */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">{t('returnsToFixRequired')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.returns} layout="horizontal">
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis 
-                  dataKey="name" 
-                  stroke="hsl(var(--muted-foreground))"
-                  tick={{ fontSize: 11 }}
-                  angle={-45}
-                  textAnchor="end"
-                  height={70}
-                />
-                <YAxis stroke="hsl(var(--muted-foreground))" />
-                <Tooltip content={<CountTooltip />} />
-                <Bar dataKey="value" fill="hsl(0, 72%, 51%)" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+        {/* STG Testing Time Chart */}
+        <ScrollableBarChart
+          data={chartData.stgTestingSpeed}
+          title={t('avgStgTestTimeChart')}
+          fill="hsl(38, 92%, 50%)"
+          tooltipType="hours"
+        />
 
-      {/* DEV Iterations Chart - Horizontal Bar */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">{t('devIterationsPerTester')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.devIterations} layout="horizontal">
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis 
-                  dataKey="name" 
-                  stroke="hsl(var(--muted-foreground))"
-                  tick={{ fontSize: 11 }}
-                  angle={-45}
-                  textAnchor="end"
-                  height={70}
-                />
-                <YAxis stroke="hsl(var(--muted-foreground))" />
-                <Tooltip content={<CountTooltip />} />
-                <Bar dataKey="value" fill="hsl(280, 65%, 60%)" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+        {/* Returns Chart */}
+        <ScrollableBarChart
+          data={chartData.returns}
+          title={t('returnsToFixRequired')}
+          fill="hsl(0, 72%, 51%)"
+          tooltipType="count"
+        />
 
-      {/* STG Iterations Chart - Horizontal Bar */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">{t('stgIterationsPerTester')}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.stgIterations} layout="horizontal">
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis 
-                  dataKey="name" 
-                  stroke="hsl(var(--muted-foreground))"
-                  tick={{ fontSize: 11 }}
-                  angle={-45}
-                  textAnchor="end"
-                  height={70}
-                />
-                <YAxis stroke="hsl(var(--muted-foreground))" />
-                <Tooltip content={<CountTooltip />} />
-                <Bar dataKey="value" fill="hsl(199, 89%, 48%)" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
+        {/* DEV Iterations Chart */}
+        <ScrollableBarChart
+          data={chartData.devIterations}
+          title={t('devIterationsPerTester')}
+          fill="hsl(280, 65%, 60%)"
+          tooltipType="count"
+        />
+
+        {/* STG Iterations Chart */}
+        <ScrollableBarChart
+          data={chartData.stgIterations}
+          title={t('stgIterationsPerTester')}
+          fill="hsl(199, 89%, 48%)"
+          tooltipType="count"
+        />
+
+        {/* Story Points Cost Chart */}
+        {chartData.storyPointsCost && chartData.storyPointsCost.length > 0 && (
+          <ScrollableBarChart
+            data={chartData.storyPointsCost}
+            title={t('storyPointsCostChart')}
+            fill="hsl(25, 95%, 53%)"
+            tooltipType="hours"
+          />
+        )}
+      </div>
 
       {/* PR Comments Pie Chart */}
-      <Card className="md:col-span-2">
+      <Card className={prFullscreen ? "fixed inset-4 z-50 overflow-auto" : ""}>
         <CardHeader>
           <div className="flex items-center justify-between">
             <CardTitle className="text-lg">{t('prCommentsByAuthor')}</CardTitle>
-            <div className="flex items-center space-x-2">
-              <Switch
-                id="testers-only"
-                checked={showTestersOnly}
-                onCheckedChange={setShowTestersOnly}
-              />
-              <Label htmlFor="testers-only" className="text-sm text-muted-foreground">
-                {t('showTestersOnly')}
-              </Label>
+            <div className="flex items-center gap-4">
+              <div className="flex items-center space-x-2">
+                <Switch
+                  id="testers-only"
+                  checked={showTestersOnly}
+                  onCheckedChange={setShowTestersOnly}
+                />
+                <Label htmlFor="testers-only" className="text-sm text-muted-foreground">
+                  {t('showTestersOnly')}
+                </Label>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPrFullscreen(!prFullscreen)}
+                className="h-8 w-8 p-0"
+              >
+                {prFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+              </Button>
             </div>
           </div>
         </CardHeader>
         <CardContent>
-          <div className="h-[300px]">
+          <div className={prFullscreen ? "h-[calc(100vh-200px)]" : "h-[300px]"}>
             {filteredPrComments.length > 0 ? (
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
@@ -270,7 +294,7 @@ export function MetricsCharts({ chartData }: MetricsChartsProps) {
                     cy="50%"
                     labelLine={false}
                     label={({ name, value }) => `${name}: ${value}`}
-                    outerRadius={100}
+                    outerRadius={prFullscreen ? 200 : 100}
                     fill="#8884d8"
                     dataKey="value"
                   >

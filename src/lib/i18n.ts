@@ -113,6 +113,8 @@ export const labels = {
   close: 'Закрыть',
   openInAdo: 'Открыть в Azure DevOps',
   clickToViewDetails: 'Нажмите для просмотра деталей',
+  items: 'элементов',
+  total: 'Итого',
   
   // PR drill-down
   prDetails: 'Детали Pull Requests',

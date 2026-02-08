@@ -30,7 +30,8 @@ type SortField =
   | 'avgTotalReturnsPerTask'
   | 'avgCodeReviewReturnsPerTask'
   | 'avgDevTestingReturnsPerTask'
-  | 'avgStgTestingReturnsPerTask';
+  | 'avgStgTestingReturnsPerTask'
+  | 'avgOriginalEstimate';
 
 type SortDirection = 'asc' | 'desc';
 
@@ -44,6 +45,7 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
   const [drillDownOpen, setDrillDownOpen] = useState(false);
   const [drillDownTitle, setDrillDownTitle] = useState("");
   const [drillDownItems, setDrillDownItems] = useState<WorkItemReference[]>([]);
+  const [drillDownType, setDrillDownType] = useState<'developer' | 'tester'>('developer');
 
   const allDevelopers = useMemo(() => 
     metrics.map(m => m.developer).sort((a, b) => a.localeCompare(b)),
@@ -78,6 +80,7 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
   const openDrillDown = (title: string, items: WorkItemReference[]) => {
     setDrillDownTitle(title);
     setDrillDownItems(items);
+    setDrillDownType('developer');
     setDrillDownOpen(true);
   };
 
@@ -217,6 +220,7 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
             <tr>
               <SortableHeader field="developer">{t('developer')}</SortableHeader>
               <SortableHeader field="avgDevTimeHours">{t('avgDevTimeActive')}</SortableHeader>
+              <SortableHeader field="avgOriginalEstimate">{t('avgOriginalEstimate')}</SortableHeader>
               <SortableHeader field="itemsCompleted">{t('itemsCompleted')}</SortableHeader>
               <SortableHeader field="totalReturnCount">{t('totalReturnsShort')}</SortableHeader>
               <SortableHeader field="avgTotalReturnsPerTask">{t('avgReturnsPerTask')}</SortableHeader>
@@ -233,6 +237,11 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
               <tr key={metric.developer} style={{ animationDelay: `${index * 50}ms` }}>
                 <td className="font-medium">{metric.developer}</td>
                 <td>{formatDuration(metric.avgDevTimeHours)}</td>
+                <td>
+                  {metric.itemsWithEstimate > 0 
+                    ? `${formatNumber(metric.avgOriginalEstimate, 1)} SP` 
+                    : '—'}
+                </td>
                 <td>
                   <ClickableCell
                     value={metric.itemsCompleted}
@@ -288,6 +297,7 @@ export function DeveloperMetricsTable({ metrics, organization, project }: Develo
         items={drillDownItems}
         organization={organization}
         project={project}
+        showTimeColumns={true}
       />
     </div>
   );
