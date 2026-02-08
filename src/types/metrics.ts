@@ -27,6 +27,11 @@ export interface WorkItemReference {
   count: number; // Count for this specific metric (e.g., returns count, iterations count)
   assignedToChanged: boolean;
   assignedToHistory: string[];
+  // New fields for drill-down enrichment
+  activeTimeHours?: number; // Working time in Active state (calendar-normalized)
+  devTestTimeHours?: number; // Working time in DEV testing
+  stgTestTimeHours?: number; // Working time in STG testing
+  originalEstimate?: number; // Story points (Original Estimate)
 }
 
 // PR reference for drill-down (enhanced with authors array)
@@ -37,6 +42,23 @@ export interface PRReference {
   workItemTitle: string;
   commentsCount: number;
   authors: string[]; // All comment authors on this PR
+}
+
+// Story points analytics
+export interface StoryPointsAnalytics {
+  averageStoryPoints: number; // Sum of SP / count of items with SP
+  itemsWithEstimate: number;
+  itemsWithoutEstimate: number;
+  totalStoryPoints: number;
+  costPerStoryPoint: number; // Active hours / SP for items with SP
+  fibonacciBreakdown: FibonacciBreakdown[];
+}
+
+export interface FibonacciBreakdown {
+  estimate: number; // 1, 2, 3, 5, 8, 13, 21, etc.
+  itemCount: number;
+  totalActiveHours: number;
+  avgHoursPerSp: number;
 }
 
 export interface DeveloperMetrics {
@@ -53,6 +75,10 @@ export interface DeveloperMetrics {
   avgCodeReviewReturnsPerTask: number;
   avgDevTestingReturnsPerTask: number;
   avgStgTestingReturnsPerTask: number;
+  // Story points (new)
+  avgOriginalEstimate: number; // Average SP for this developer's tasks
+  totalOriginalEstimate: number;
+  itemsWithEstimate: number;
   // Drill-down data
   workItems: WorkItemReference[];
   returnItems: WorkItemReference[];
@@ -77,6 +103,10 @@ export interface TesterMetrics {
   avgPrCommentsPerPr: number;
   tasksWorkedOn: number;
   prsReviewed: number;
+  // Story points (new)
+  avgOriginalEstimate: number; // Average SP for tasks tested
+  totalOriginalEstimate: number;
+  itemsWithEstimate: number;
   // Drill-down data
   closedItems: WorkItemReference[];
   devIterationItems: WorkItemReference[];
@@ -101,10 +131,21 @@ export interface PRChartDataPoint extends ChartDataPoint {
   isTester?: boolean;
 }
 
+// Filter state for client-side filtering
+export interface AnalysisFilters {
+  workItemTypes: Set<string>; // 'Requirement', 'Bug', 'Task'
+  stateTransition?: {
+    state: string;
+    fromDate: Date | null;
+    toDate: Date | null;
+  };
+}
+
 export interface AnalysisResult {
   developerMetrics: DeveloperMetrics[];
   testerMetrics: TesterMetrics[];
   prCommentAuthors: PRCommentAuthor[];
+  storyPointsAnalytics?: StoryPointsAnalytics; // New
   summary: {
     totalWorkItems: number;
     totalRequirements: number;
@@ -115,6 +156,9 @@ export interface AnalysisResult {
     avgStgTestTimeHours: number;
     totalReturns: number;
     totalPrComments: number;
+    // Story points summary (new)
+    avgStoryPoints?: number;
+    costPerStoryPoint?: number;
   };
   chartData: {
     developmentSpeed: ChartDataPoint[];
@@ -124,9 +168,36 @@ export interface AnalysisResult {
     devIterations: ChartDataPoint[];
     stgIterations: ChartDataPoint[];
     prComments: PRChartDataPoint[];
+    storyPointsCost?: ChartDataPoint[]; // Fibonacci breakdown chart
   };
   // Unassigned items for drill-down
   unassignedItems: WorkItemReference[];
+  // Raw work item data for client-side filtering (new)
+  workItemsRaw?: WorkItemRaw[];
+}
+
+// Raw work item data for client-side filtering
+export interface WorkItemRaw {
+  id: number;
+  title: string;
+  type: string;
+  state: string;
+  assignedTo: string;
+  testedBy1?: string;
+  testedBy2?: string;
+  originalEstimate?: number;
+  activeTimeHours: number;
+  devTestTimeHours: number;
+  stgTestTimeHours: number;
+  // State transitions for filtering
+  stateTransitions: StateTransitionRaw[];
+}
+
+export interface StateTransitionRaw {
+  fromState: string;
+  toState: string;
+  timestamp: string; // ISO string
+  changedBy?: string;
 }
 
 export interface WorkItemRevision {
@@ -181,3 +252,6 @@ export const WORK_ITEM_TYPES = {
   BUG: 'Bug',
   TASK: 'Task',
 } as const;
+
+// Fibonacci sequence for story points
+export const FIBONACCI_SEQUENCE = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89] as const;

@@ -7,13 +7,106 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-const CHUNK_SIZE = 50; // Work items per chunk
-const DEBUG_THRESHOLD = 20; // Auto-enable verbose debug for <= 20 items
-const STALL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes - mark job failed if no progress
+const CHUNK_SIZE = 50;
+const DEBUG_THRESHOLD = 20;
+const STALL_TIMEOUT_MS = 5 * 60 * 1000;
+
+// ============== Working Time Calculation ==============
+// Inline to avoid import issues in edge functions
+
+const UTC_PLUS_3_OFFSET_MS = 3 * 60 * 60 * 1000;
+const WORK_START_HOUR = 9;
+const WORK_END_HOUR = 18;
+
+const FIXED_HOLIDAYS = new Set([
+  "12-31", "01-01", "01-02", "01-03", "01-04", "01-05", "01-06", "01-07", "01-08",
+  "02-23", "03-08", "05-01", "05-09", "06-12", "11-04",
+]);
+
+function toMoscowTime(utcDate: Date): Date {
+  return new Date(utcDate.getTime() + UTC_PLUS_3_OFFSET_MS);
+}
+
+function isWeekend(moscowDate: Date): boolean {
+  const day = moscowDate.getUTCDay();
+  return day === 0 || day === 6;
+}
+
+function isHoliday(moscowDate: Date): boolean {
+  const month = String(moscowDate.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(moscowDate.getUTCDate()).padStart(2, '0');
+  return FIXED_HOLIDAYS.has(`${month}-${day}`);
+}
+
+function isNonWorkingDay(moscowDate: Date): boolean {
+  return isWeekend(moscowDate) || isHoliday(moscowDate);
+}
+
+function getWorkDayStart(moscowDate: Date): Date | null {
+  if (isNonWorkingDay(moscowDate)) return null;
+  const result = new Date(moscowDate);
+  result.setUTCHours(WORK_START_HOUR, 0, 0, 0);
+  return result;
+}
+
+function getWorkDayEnd(moscowDate: Date): Date | null {
+  if (isNonWorkingDay(moscowDate)) return null;
+  const result = new Date(moscowDate);
+  result.setUTCHours(WORK_END_HOUR, 0, 0, 0);
+  return result;
+}
+
+function getNextDay(moscowDate: Date): Date {
+  const result = new Date(moscowDate);
+  result.setUTCDate(result.getUTCDate() + 1);
+  result.setUTCHours(0, 0, 0, 0);
+  return result;
+}
+
+function calculateWorkingTime(startUtc: Date, endUtc: Date): number {
+  if (endUtc <= startUtc) return 0;
+  
+  const startMoscow = toMoscowTime(startUtc);
+  const endMoscow = toMoscowTime(endUtc);
+  
+  let totalHours = 0;
+  let currentMoscow = new Date(startMoscow);
+  
+  while (currentMoscow < endMoscow) {
+    if (isNonWorkingDay(currentMoscow)) {
+      currentMoscow = getNextDay(currentMoscow);
+      continue;
+    }
+    
+    const dayStart = getWorkDayStart(currentMoscow)!;
+    const dayEnd = getWorkDayEnd(currentMoscow)!;
+    
+    const effectiveStart = new Date(Math.max(currentMoscow.getTime(), dayStart.getTime()));
+    const nextDay = getNextDay(currentMoscow);
+    const effectiveEnd = new Date(Math.min(endMoscow.getTime(), dayEnd.getTime(), nextDay.getTime()));
+    
+    if (effectiveStart < dayEnd && effectiveEnd > dayStart) {
+      const clampedStart = new Date(Math.max(effectiveStart.getTime(), dayStart.getTime()));
+      const clampedEnd = new Date(Math.min(effectiveEnd.getTime(), dayEnd.getTime()));
+      
+      if (clampedEnd > clampedStart) {
+        const hoursThisDay = (clampedEnd.getTime() - clampedStart.getTime()) / (1000 * 60 * 60);
+        totalHours += hoursThisDay;
+      }
+    }
+    
+    currentMoscow = nextDay;
+  }
+  
+  return Math.round(totalHours * 10000) / 10000;
+}
+
+// ============== Fibonacci sequence for story points ==============
+const FIBONACCI_SEQUENCE = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89];
 
 interface ProcessChunkRequest {
   jobId: string;
-  pat: string; // PAT is required for Azure API calls
+  pat: string;
 }
 
 // ============== Stage Telemetry ==============
@@ -34,21 +127,17 @@ function logStageTelemetry(telemetry: StageTelemetry) {
 }
 
 function startStage(jobId: string, stage: string): StageTelemetry {
-  return {
-    jobId,
-    stage,
-    startTime: Date.now(),
-    counts: {},
-  };
+  return { jobId, stage, startTime: Date.now(), counts: {} };
 }
 
-// ============== Domain Debug Logging (Verbose Mode Only) ==============
+// ============== Domain Debug Logging ==============
 
 interface DomainDebugLog {
   workItemId: number;
   title: string;
   type: string;
   currentState: string;
+  originalEstimate: number | null;
   attribution: {
     currentAssignedTo: string;
     fallbackUsed: boolean;
@@ -59,7 +148,8 @@ interface DomainDebugLog {
     toState: string;
     enteredAt: string;
     leftAt: string;
-    durationHours: number;
+    rawDurationHours: number;
+    workingDurationHours: number;
     changedBy: string | null;
     assignedToAtTransition: string | null;
   }>;
@@ -67,11 +157,13 @@ interface DomainDebugLog {
     activePeriods: Array<{
       start: string;
       end: string | null;
-      durationHours: number;
+      rawDurationHours: number;
+      workingDurationHours: number;
       included: boolean;
       exclusionReason?: string;
     }>;
-    totalActiveHours: number;
+    totalRawHours: number;
+    totalWorkingHours: number;
     developmentCycles: number;
     stoppedAtFirstDevAcceptance: boolean;
   };
@@ -82,7 +174,8 @@ interface DomainDebugLog {
       periods: Array<{
         start: string;
         end: string;
-        durationHours: number;
+        rawDurationHours: number;
+        workingDurationHours: number;
       }>;
       merged: boolean;
       mergeReason?: string;
@@ -95,7 +188,8 @@ interface DomainDebugLog {
       periods: Array<{
         start: string;
         end: string;
-        durationHours: number;
+        rawDurationHours: number;
+        workingDurationHours: number;
       }>;
       merged: boolean;
       mergeReason?: string;
@@ -147,22 +241,6 @@ async function azureRequest(url: string, pat: string): Promise<unknown> {
   return response.json();
 }
 
-/**
- * SINGLE-CHUNK PROCESSOR
- * 
- * This function processes EXACTLY ONE chunk per invocation.
- * It is called repeatedly by the UI/client in a pull-based loop.
- * 
- * Flow:
- * 1. Load job state from database
- * 2. Check stall timeout
- * 3. Find next unprocessed chunk
- * 4. Process that ONE chunk
- * 5. Persist chunk result
- * 6. Update job progress
- * 7. If all chunks done → finalize job
- * 8. Return status
- */
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -180,7 +258,6 @@ serve(async (req) => {
       throw new Error('Missing required fields: jobId, pat');
     }
 
-    // Load job state
     const { data: job, error: loadError } = await (supabase.from('analysis_jobs') as any)
       .select('*')
       .eq('id', jobId)
@@ -190,7 +267,6 @@ serve(async (req) => {
       throw new Error(`Job not found: ${loadError?.message || 'unknown'}`);
     }
 
-    // Check if job is already completed or failed
     if (job.status === 'completed') {
       return new Response(JSON.stringify({
         jobId,
@@ -208,7 +284,6 @@ serve(async (req) => {
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Stall detection
     if (job.last_progress_at) {
       const lastProgress = new Date(job.last_progress_at).getTime();
       if (Date.now() - lastProgress > STALL_TIMEOUT_MS) {
@@ -227,12 +302,9 @@ serve(async (req) => {
     const organization = job.organization as string;
     const project = job.project as string;
 
-    // Check if all chunks are already processed
     if (completedChunks >= totalChunks) {
-      // Finalize the job
       await finalizeJob(supabase as any, jobId, organization, project, pat, workItemIds);
       
-      // Re-fetch the completed job
       const { data: completedJob } = await (supabase.from('analysis_jobs') as any)
         .select('result')
         .eq('id', jobId)
@@ -246,17 +318,14 @@ serve(async (req) => {
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Determine which chunk to process next
     const chunkIndex = completedChunks;
     const isVerbose = workItemIds.length <= DEBUG_THRESHOLD;
     const debugLogs: DebugOutput = { workItems: {}, prComments: [] };
 
     console.log(`[Job ${jobId}] Processing chunk ${chunkIndex + 1}/${totalChunks}`);
 
-    // Update status before processing
     await updateJobStatus(supabase as any, jobId, `Processing chunk ${chunkIndex + 1}/${totalChunks}...`);
 
-    // Fetch work items for this chunk only
     const chunkStart = chunkIndex * CHUNK_SIZE;
     const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, workItemIds.length);
     const chunkWorkItemIds = workItemIds.slice(chunkStart, chunkEnd);
@@ -266,12 +335,10 @@ serve(async (req) => {
     fetchStage.counts = { workItems: workItems.length, chunkIndex };
     logStageTelemetry(fetchStage);
 
-    // Process this single chunk
     const chunkResult = await processWorkItemChunkWithPRs(
       organization, project, pat, workItems, isVerbose, debugLogs, jobId, chunkIndex
     );
 
-    // Persist chunk result
     const persistStage = startStage(jobId, 'persist_chunk');
     const { error: insertError } = await (supabase.from('analysis_chunks') as any).insert({
       job_id: jobId,
@@ -288,7 +355,6 @@ serve(async (req) => {
 
     console.log(`[Job ${jobId}] Chunk ${chunkIndex + 1}/${totalChunks} persisted`);
 
-    // Update job progress
     const newCompletedChunks = chunkIndex + 1;
     const newProcessedItems = Math.min(chunkEnd, workItemIds.length);
     const progress = Math.round((newCompletedChunks / totalChunks) * 100);
@@ -302,9 +368,7 @@ serve(async (req) => {
       })
       .eq('id', jobId);
 
-    // Check if this was the last chunk
     if (newCompletedChunks >= totalChunks) {
-      // Finalize the job
       await finalizeJob(supabase as any, jobId, organization, project, pat, workItemIds);
       
       const { data: completedJob } = await (supabase.from('analysis_jobs') as any)
@@ -323,7 +387,6 @@ serve(async (req) => {
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // More chunks to process
     return new Response(JSON.stringify({
       jobId,
       status: 'processing',
@@ -357,7 +420,6 @@ async function finalizeJob(
     
     await updateJobStatus(supabase, jobId, 'Merging results...');
 
-    // Load all persisted chunks
     const loadStage = startStage(jobId, 'load_chunks');
     const { data: chunks, error: loadError } = await (supabase.from('analysis_chunks') as any)
       .select('chunk_index, data')
@@ -372,10 +434,8 @@ async function finalizeJob(
     logStageTelemetry(loadStage);
     console.log(`[Job ${jobId}] Loaded ${chunks?.length || 0} chunks`);
 
-    // Re-fetch work items for summary (lightweight)
     const workItems = await fetchWorkItemsBatched(organization, project, workItemIds, pat);
 
-    // Merge all chunks
     const mergeStage = startStage(jobId, 'merge_chunks');
     const allChunkResults = (chunks || []).map((c: any) => c.data as ChunkResult);
     const finalResult = mergeChunkResultsNumeric(allChunkResults, workItems);
@@ -384,7 +444,6 @@ async function finalizeJob(
     
     console.log(`[Job ${jobId}] Merged ${allChunkResults.length} chunks`);
 
-    // Save final result
     const persistResultStage = startStage(jobId, 'persist_result');
     const { error: updateError } = await (supabase.from('analysis_jobs') as any)
       .update({
@@ -503,6 +562,10 @@ interface WorkItemReference {
   count: number;
   assignedToChanged: boolean;
   assignedToHistory: string[];
+  activeTimeHours?: number;
+  devTestTimeHours?: number;
+  stgTestTimeHours?: number;
+  originalEstimate?: number;
 }
 
 interface PRReference {
@@ -526,6 +589,10 @@ interface ChunkResult {
   requirements: number;
   bugs: number;
   tasks: number;
+  // Story points aggregates
+  spAgg: StoryPointsAgg;
+  // Raw work items for client-side filtering
+  workItemsRaw: WorkItemRaw[];
   prStats?: { 
     prs: number; 
     comments: number;
@@ -536,6 +603,34 @@ interface ChunkResult {
   };
 }
 
+interface StoryPointsAgg {
+  totalSp: number;
+  itemsWithSp: number;
+  itemsWithoutSp: number;
+  totalActiveHoursWithSp: number;
+  fibonacciData: Record<number, { count: number; totalHours: number }>;
+}
+
+interface WorkItemRaw {
+  id: number;
+  title: string;
+  type: string;
+  state: string;
+  assignedTo: string;
+  testedBy1?: string;
+  testedBy2?: string;
+  originalEstimate?: number;
+  activeTimeHours: number;
+  devTestTimeHours: number;
+  stgTestTimeHours: number;
+  stateTransitions: Array<{
+    fromState: string;
+    toState: string;
+    timestamp: string;
+    changedBy?: string;
+  }>;
+}
+
 interface DevAggData {
   hours: number;
   cycles: number;
@@ -543,6 +638,8 @@ interface DevAggData {
   dev: number;
   stg: number;
   completed: number;
+  totalSp: number;
+  itemsWithSp: number;
   items: WorkItemReference[];
   returns: WorkItemReference[];
   crReturns: WorkItemReference[];
@@ -557,6 +654,8 @@ interface TesterAggData {
   stgCycles: number;
   devIter: number;
   stgIter: number;
+  totalSp: number;
+  itemsWithSp: number;
   closed: WorkItemReference[];
   devItems: WorkItemReference[];
   stgItems: WorkItemReference[];
@@ -576,20 +675,22 @@ interface WorkItemDebugLog {
   title: string;
   currentAssignedTo: string;
   assignedToHistory: string[];
+  originalEstimate: number | null;
   activePeriods: Array<{
     start: string;
     end: string | null;
-    durationHours: number;
+    rawDurationHours: number;
+    workingDurationHours: number;
   }>;
   devTestingCycles: Array<{
     tester: string;
-    periods: Array<{ start: string; end: string; durationHours: number }>;
+    periods: Array<{ start: string; end: string; rawDurationHours: number; workingDurationHours: number }>;
     merged: boolean;
     closingStatus: string;
   }>;
   stgTestingCycles: Array<{
     tester: string;
-    periods: Array<{ start: string; end: string; durationHours: number }>;
+    periods: Array<{ start: string; end: string; rawDurationHours: number; workingDurationHours: number }>;
     merged: boolean;
     closingStatus: string;
   }>;
@@ -638,7 +739,6 @@ function extractAssignedToHistory(revisions: WorkItemRevision[]): string[] {
   return history;
 }
 
-// Developer attribution: current AssignedTo -> fallback to last known -> Unassigned
 function getCurrentAssignedTo(wi: WorkItem, history: string[]): { name: string; fallbackUsed: boolean } {
   const current = getDisplayName(wi.fields['System.AssignedTo']);
   if (current) return { name: current, fallbackUsed: false };
@@ -668,48 +768,77 @@ function extractTransitions(revisions: WorkItemRevision[], workItemId: number): 
 interface ActivePeriod {
   start: Date;
   end: Date | null;
-  durationHours: number;
+  rawDurationHours: number;
+  workingDurationHours: number;
   included: boolean;
   exclusionReason?: string;
 }
 
-function calculateDevelopmentTime(transitions: TransitionEvent[]): { totalHours: number; cycles: number; activePeriods: ActivePeriod[]; stoppedAtFirstDevAcceptance: boolean } {
-  let totalHours = 0;
+function calculateDevelopmentTime(transitions: TransitionEvent[]): { 
+  totalRawHours: number; 
+  totalWorkingHours: number; 
+  cycles: number; 
+  activePeriods: ActivePeriod[]; 
+  stoppedAtFirstDevAcceptance: boolean 
+} {
+  let totalRawHours = 0;
+  let totalWorkingHours = 0;
   let cycles = 0;
   let activeStart: Date | null = null;
   const activePeriods: ActivePeriod[] = [];
   let stoppedAtFirstDevAcceptance = false;
 
   for (const t of transitions) {
-    // Stop counting at first DEV_Acceptance Testing transition (business rule)
     if (t.toState === STATES.DEV_ACCEPTANCE_TESTING) {
       if (activeStart) {
-        const duration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
-        totalHours += duration;
+        const rawDuration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
+        const workingDuration = calculateWorkingTime(activeStart, t.timestamp);
+        totalRawHours += rawDuration;
+        totalWorkingHours += workingDuration;
         cycles++;
-        activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration, included: true });
+        activePeriods.push({ 
+          start: activeStart, 
+          end: t.timestamp, 
+          rawDurationHours: rawDuration,
+          workingDurationHours: workingDuration, 
+          included: true 
+        });
         activeStart = null;
       }
       stoppedAtFirstDevAcceptance = true;
-      return { totalHours, cycles, activePeriods, stoppedAtFirstDevAcceptance };
+      return { totalRawHours, totalWorkingHours, cycles, activePeriods, stoppedAtFirstDevAcceptance };
     }
     if (t.toState === STATES.ACTIVE) {
       activeStart = t.timestamp;
     } else if (t.fromState === STATES.ACTIVE && activeStart) {
-      const duration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
-      totalHours += duration;
+      const rawDuration = (t.timestamp.getTime() - activeStart.getTime()) / 3600000;
+      const workingDuration = calculateWorkingTime(activeStart, t.timestamp);
+      totalRawHours += rawDuration;
+      totalWorkingHours += workingDuration;
       cycles++;
-      activePeriods.push({ start: activeStart, end: t.timestamp, durationHours: duration, included: true });
+      activePeriods.push({ 
+        start: activeStart, 
+        end: t.timestamp, 
+        rawDurationHours: rawDuration,
+        workingDurationHours: workingDuration, 
+        included: true 
+      });
       activeStart = null;
     }
   }
   
-  // Handle case where still in Active state
   if (activeStart) {
-    activePeriods.push({ start: activeStart, end: null, durationHours: 0, included: false, exclusionReason: 'Still in Active state' });
+    activePeriods.push({ 
+      start: activeStart, 
+      end: null, 
+      rawDurationHours: 0,
+      workingDurationHours: 0, 
+      included: false, 
+      exclusionReason: 'Still in Active state' 
+    });
   }
   
-  return { totalHours, cycles, activePeriods, stoppedAtFirstDevAcceptance };
+  return { totalRawHours, totalWorkingHours, cycles, activePeriods, stoppedAtFirstDevAcceptance };
 }
 
 interface FixRequiredReturn {
@@ -750,7 +879,7 @@ function countReturns(transitions: TransitionEvent[]): { cr: number; dev: number
 interface TestingCycleDetail {
   tester: string;
   cycleNumber: number;
-  periods: Array<{ start: Date; end: Date; durationHours: number }>;
+  periods: Array<{ start: Date; end: Date; rawDurationHours: number; workingDurationHours: number }>;
   merged: boolean;
   mergeReason?: string;
   iterationsCounted: number;
@@ -761,10 +890,24 @@ function calculateTestingMetricsWithDetails(
   transitions: TransitionEvent[],
   inTestingState: string,
   acceptanceState: string
-): { metrics: Map<string, { hours: number; cycles: number; iterations: number }>; cycles: TestingCycleDetail[] } {
-  const metrics = new Map<string, { hours: number; cycles: number; iterations: number }>();
+): { 
+  metrics: Map<string, { rawHours: number; workingHours: number; cycles: number; iterations: number }>; 
+  cycles: TestingCycleDetail[];
+  totalRawHours: number;
+  totalWorkingHours: number;
+} {
+  const metrics = new Map<string, { rawHours: number; workingHours: number; cycles: number; iterations: number }>();
   const cycles: TestingCycleDetail[] = [];
-  let cycle: { tester: string; start: Date; periods: Array<{ start: Date; end: Date; durationHours: number }>; pendingMerge: boolean; lastState: string; cycleNumber: number } | null = null;
+  let totalRawHours = 0;
+  let totalWorkingHours = 0;
+  let cycle: { 
+    tester: string; 
+    start: Date; 
+    periods: Array<{ start: Date; end: Date; rawDurationHours: number; workingDurationHours: number }>; 
+    pendingMerge: boolean; 
+    lastState: string; 
+    cycleNumber: number 
+  } | null = null;
   let cycleCounter = 0;
 
   for (let i = 0; i < transitions.length; i++) {
@@ -774,16 +917,19 @@ function calculateTestingMetricsWithDetails(
       const tester = t.changedBy || t.assignedTo || 'Unknown';
 
       if (cycle?.pendingMerge && t.fromState === acceptanceState && cycle.tester === tester) {
-        // Merge: same tester moving back from acceptance to testing
         cycle.pendingMerge = false;
       } else {
         if (cycle) {
-          const hours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
-          if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
+          const rawHours = cycle.periods.reduce((a, b) => a + b.rawDurationHours, 0);
+          const workHours = cycle.periods.reduce((a, b) => a + b.workingDurationHours, 0);
+          if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { rawHours: 0, workingHours: 0, cycles: 0, iterations: 0 });
           const m = metrics.get(cycle.tester)!;
-          m.hours += hours;
+          m.rawHours += rawHours;
+          m.workingHours += workHours;
           m.cycles++;
           m.iterations++;
+          totalRawHours += rawHours;
+          totalWorkingHours += workHours;
           cycles.push({ 
             tester: cycle.tester, 
             cycleNumber: cycle.cycleNumber,
@@ -798,8 +944,9 @@ function calculateTestingMetricsWithDetails(
         cycle = { tester, start: t.timestamp, periods: [], pendingMerge: false, lastState: inTestingState, cycleNumber: cycleCounter };
       }
     } else if (t.fromState === inTestingState && cycle) {
-      const durationHours = (t.timestamp.getTime() - cycle.start.getTime()) / 3600000;
-      cycle.periods.push({ start: cycle.start, end: t.timestamp, durationHours });
+      const rawDuration = (t.timestamp.getTime() - cycle.start.getTime()) / 3600000;
+      const workingDuration = calculateWorkingTime(cycle.start, t.timestamp);
+      cycle.periods.push({ start: cycle.start, end: t.timestamp, rawDurationHours: rawDuration, workingDurationHours: workingDuration });
       cycle.lastState = t.toState;
 
       if (t.toState === acceptanceState) {
@@ -817,12 +964,16 @@ function calculateTestingMetricsWithDetails(
           cycle.pendingMerge = true;
           cycle.start = t.timestamp;
         } else {
-          const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
-          if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
+          const rawHours = cycle.periods.reduce((a, b) => a + b.rawDurationHours, 0);
+          const workHours = cycle.periods.reduce((a, b) => a + b.workingDurationHours, 0);
+          if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { rawHours: 0, workingHours: 0, cycles: 0, iterations: 0 });
           const m = metrics.get(cycle.tester)!;
-          m.hours += totalHours;
+          m.rawHours += rawHours;
+          m.workingHours += workHours;
           m.cycles++;
           m.iterations++;
+          totalRawHours += rawHours;
+          totalWorkingHours += workHours;
           cycles.push({ 
             tester: cycle.tester, 
             cycleNumber: cycle.cycleNumber,
@@ -834,12 +985,16 @@ function calculateTestingMetricsWithDetails(
           cycle = null;
         }
       } else {
-        const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
-        if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
+        const rawHours = cycle.periods.reduce((a, b) => a + b.rawDurationHours, 0);
+        const workHours = cycle.periods.reduce((a, b) => a + b.workingDurationHours, 0);
+        if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { rawHours: 0, workingHours: 0, cycles: 0, iterations: 0 });
         const m = metrics.get(cycle.tester)!;
-        m.hours += totalHours;
+        m.rawHours += rawHours;
+        m.workingHours += workHours;
         m.cycles++;
         m.iterations++;
+        totalRawHours += rawHours;
+        totalWorkingHours += workHours;
         cycles.push({ 
           tester: cycle.tester, 
           cycleNumber: cycle.cycleNumber,
@@ -851,12 +1006,16 @@ function calculateTestingMetricsWithDetails(
         cycle = null;
       }
     } else if (cycle?.pendingMerge && t.fromState === acceptanceState && t.toState !== inTestingState) {
-      const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
-      if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
+      const rawHours = cycle.periods.reduce((a, b) => a + b.rawDurationHours, 0);
+      const workHours = cycle.periods.reduce((a, b) => a + b.workingDurationHours, 0);
+      if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { rawHours: 0, workingHours: 0, cycles: 0, iterations: 0 });
       const m = metrics.get(cycle.tester)!;
-      m.hours += totalHours;
+      m.rawHours += rawHours;
+      m.workingHours += workHours;
       m.cycles++;
       m.iterations++;
+      totalRawHours += rawHours;
+      totalWorkingHours += workHours;
       cycles.push({ 
         tester: cycle.tester, 
         cycleNumber: cycle.cycleNumber,
@@ -871,11 +1030,15 @@ function calculateTestingMetricsWithDetails(
   }
 
   if (cycle) {
-    const totalHours = cycle.periods.reduce((a, b) => a + b.durationHours, 0);
-    if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { hours: 0, cycles: 0, iterations: 0 });
+    const rawHours = cycle.periods.reduce((a, b) => a + b.rawDurationHours, 0);
+    const workHours = cycle.periods.reduce((a, b) => a + b.workingDurationHours, 0);
+    if (!metrics.has(cycle.tester)) metrics.set(cycle.tester, { rawHours: 0, workingHours: 0, cycles: 0, iterations: 0 });
     const m = metrics.get(cycle.tester)!;
-    m.hours += totalHours;
+    m.rawHours += rawHours;
+    m.workingHours += workHours;
     m.cycles++;
+    totalRawHours += rawHours;
+    totalWorkingHours += workHours;
     cycles.push({ 
       tester: cycle.tester, 
       cycleNumber: cycle.cycleNumber,
@@ -887,7 +1050,7 @@ function calculateTestingMetricsWithDetails(
     });
   }
 
-  return { metrics, cycles };
+  return { metrics, cycles, totalRawHours, totalWorkingHours };
 }
 
 // ============== Chunk Processing with PR Comments ==============
@@ -907,8 +1070,21 @@ async function processWorkItemChunkWithPRs(
   const prAgg: Record<string, { count: number; prs: PRReference[] }> = {};
   const testers: string[] = [];
   const unassignedItems: WorkItemReference[] = [];
+  const workItemsRaw: WorkItemRaw[] = [];
   let totalDevHours = 0, totalDevTestHours = 0, totalStgTestHours = 0;
   let requirements = 0, bugs = 0, tasks = 0;
+  
+  // Story points aggregation
+  const spAgg: StoryPointsAgg = {
+    totalSp: 0,
+    itemsWithSp: 0,
+    itemsWithoutSp: 0,
+    totalActiveHoursWithSp: 0,
+    fibonacciData: {},
+  };
+  for (const f of FIBONACCI_SEQUENCE) {
+    spAgg.fibonacciData[f] = { count: 0, totalHours: 0 };
+  }
 
   // Filter by type
   const metricsItems = workItems.filter(wi => {
@@ -937,32 +1113,67 @@ async function processWorkItemChunkWithPRs(
       const state = wi.fields['System.State'] as string;
       const history = extractAssignedToHistory(revisions);
       
-      // Developer attribution: strictly by current AssignedTo with fallbacks
+      // Get Original Estimate (Story Points)
+      const originalEstimate = wi.fields['Microsoft.VSTS.Scheduling.OriginalEstimate'] as number | undefined;
+      
       const { name: assignedTo, fallbackUsed } = getCurrentAssignedTo(wi, history);
       const url = `https://dev.azure.com/${org}/${project}/_workitems/edit/${wi.id}`;
-
-      const ref: WorkItemReference = { id: wi.id, title, type, url, count: 0, assignedToChanged: history.length > 1, assignedToHistory: history };
 
       const t1 = getDisplayName(wi.fields['Custom.TestedBy1']);
       const t2 = getDisplayName(wi.fields['Custom.TestedBy2']);
       if (t1 && !testers.includes(t1)) testers.push(t1);
       if (t2 && !testers.includes(t2)) testers.push(t2);
 
-      // Dev time
+      // Dev time with working hours
       const devTime = calculateDevelopmentTime(transitions);
-      totalDevHours += devTime.totalHours;
+      totalDevHours += devTime.totalWorkingHours;
 
+      // Initialize dev aggregation
       if (!devAgg[assignedTo]) {
-        devAgg[assignedTo] = { hours: 0, cycles: 0, cr: 0, dev: 0, stg: 0, completed: 0, items: [], returns: [], crReturns: [], devReturns: [], stgReturns: [] };
+        devAgg[assignedTo] = { 
+          hours: 0, cycles: 0, cr: 0, dev: 0, stg: 0, completed: 0, 
+          totalSp: 0, itemsWithSp: 0,
+          items: [], returns: [], crReturns: [], devReturns: [], stgReturns: [] 
+        };
       }
       const da = devAgg[assignedTo];
-      da.hours += devTime.totalHours;
+      da.hours += devTime.totalWorkingHours;
       da.cycles += devTime.cycles;
+      
+      // Story points for developer
+      if (originalEstimate !== undefined && originalEstimate > 0) {
+        da.totalSp += originalEstimate;
+        da.itemsWithSp++;
+        spAgg.totalSp += originalEstimate;
+        spAgg.itemsWithSp++;
+        spAgg.totalActiveHoursWithSp += devTime.totalWorkingHours;
+        
+        // Fibonacci breakdown
+        if (spAgg.fibonacciData[originalEstimate]) {
+          spAgg.fibonacciData[originalEstimate].count++;
+          spAgg.fibonacciData[originalEstimate].totalHours += devTime.totalWorkingHours;
+        }
+      } else {
+        spAgg.itemsWithoutSp++;
+      }
+
+      const ref: WorkItemReference = { 
+        id: wi.id, 
+        title, 
+        type, 
+        url, 
+        count: 0, 
+        assignedToChanged: history.length > 1, 
+        assignedToHistory: history,
+        activeTimeHours: devTime.totalWorkingHours,
+        originalEstimate: originalEstimate,
+      };
+      
       da.items.push({ ...ref, count: 1 });
 
       if (assignedTo === 'Unassigned') unassignedItems.push({ ...ref, count: 1 });
 
-      // Returns - attributed to current assignedTo (not at transition time)
+      // Returns
       const returnsData = countReturns(transitions);
       da.cr += returnsData.cr;
       da.dev += returnsData.dev;
@@ -976,63 +1187,121 @@ async function processWorkItemChunkWithPRs(
 
       if (state === STATES.RELEASED) da.completed++;
 
-      // DEV Testing with details for debug
+      // DEV Testing
       const devTestResult = calculateTestingMetricsWithDetails(transitions, STATES.DEV_IN_TESTING, STATES.DEV_ACCEPTANCE_TESTING);
       const attributedDevTesters: string[] = [];
       for (const [tester, data] of devTestResult.metrics) {
         attributedDevTesters.push(tester);
         if (!testerAgg[tester]) {
-          testerAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
+          testerAgg[tester] = { 
+            devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, 
+            totalSp: 0, itemsWithSp: 0,
+            closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 
+          };
         }
         const ta = testerAgg[tester];
-        ta.devHours += data.hours;
+        ta.devHours += data.workingHours;
         ta.devCycles += data.cycles;
         ta.devIter += data.iterations;
-        totalDevTestHours += data.hours;
+        totalDevTestHours += data.workingHours;
 
         if (data.iterations > 0) {
           const existing = ta.devItems.find(x => x.id === wi.id);
-          if (existing) existing.count += data.iterations;
-          else ta.devItems.push({ ...ref, count: data.iterations });
+          if (existing) {
+            existing.count += data.iterations;
+          } else {
+            ta.devItems.push({ 
+              ...ref, 
+              count: data.iterations,
+              devTestTimeHours: data.workingHours,
+            });
+          }
         }
 
         if (state === STATES.RELEASED && !ta.closed.find(x => x.id === wi.id)) {
-          ta.closed.push({ ...ref, count: 1 });
+          ta.closed.push({ ...ref, count: 1, devTestTimeHours: data.workingHours });
+          if (originalEstimate !== undefined && originalEstimate > 0) {
+            ta.totalSp += originalEstimate;
+            ta.itemsWithSp++;
+          }
         }
       }
 
-      // STG Testing with details for debug
+      // STG Testing
       const stgTestResult = calculateTestingMetricsWithDetails(transitions, STATES.STG_IN_TESTING, STATES.STG_ACCEPTANCE_TESTING);
       const attributedStgTesters: string[] = [];
       for (const [tester, data] of stgTestResult.metrics) {
         attributedStgTesters.push(tester);
         if (!testerAgg[tester]) {
-          testerAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
+          testerAgg[tester] = { 
+            devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, 
+            totalSp: 0, itemsWithSp: 0,
+            closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 
+          };
         }
         const ta = testerAgg[tester];
-        ta.stgHours += data.hours;
+        ta.stgHours += data.workingHours;
         ta.stgCycles += data.cycles;
         ta.stgIter += data.iterations;
-        totalStgTestHours += data.hours;
+        totalStgTestHours += data.workingHours;
 
         if (data.iterations > 0) {
           const existing = ta.stgItems.find(x => x.id === wi.id);
-          if (existing) existing.count += data.iterations;
-          else ta.stgItems.push({ ...ref, count: data.iterations });
+          if (existing) {
+            existing.count += data.iterations;
+          } else {
+            ta.stgItems.push({ 
+              ...ref, 
+              count: data.iterations,
+              stgTestTimeHours: data.workingHours,
+            });
+          }
         }
 
         if (state === STATES.RELEASED && !ta.closed.find(x => x.id === wi.id)) {
-          ta.closed.push({ ...ref, count: 1 });
+          const devHours = devTestResult.metrics.get(tester)?.workingHours || 0;
+          ta.closed.push({ 
+            ...ref, 
+            count: 1, 
+            devTestTimeHours: devHours,
+            stgTestTimeHours: data.workingHours,
+          });
+          if (originalEstimate !== undefined && originalEstimate > 0 && !attributedDevTesters.includes(tester)) {
+            ta.totalSp += originalEstimate;
+            ta.itemsWithSp++;
+          }
         }
       }
 
-      // VERBOSE DOMAIN DEBUG: Emit structured log per work item (only for small queries ≤20)
+      // Store raw work item for client-side filtering
+      workItemsRaw.push({
+        id: wi.id,
+        title,
+        type,
+        state,
+        assignedTo,
+        testedBy1: t1 || undefined,
+        testedBy2: t2 || undefined,
+        originalEstimate,
+        activeTimeHours: devTime.totalWorkingHours,
+        devTestTimeHours: devTestResult.totalWorkingHours,
+        stgTestTimeHours: stgTestResult.totalWorkingHours,
+        stateTransitions: transitions.map(t => ({
+          fromState: t.fromState,
+          toState: t.toState,
+          timestamp: t.timestamp.toISOString(),
+          changedBy: t.changedBy || undefined,
+        })),
+      });
+
+      // VERBOSE DOMAIN DEBUG
       if (isVerbose) {
         const domainLog: DomainDebugLog = {
           workItemId: wi.id,
           title,
           type,
           currentState: state,
+          originalEstimate: originalEstimate || null,
           attribution: {
             currentAssignedTo: assignedTo,
             fallbackUsed,
@@ -1043,7 +1312,8 @@ async function processWorkItemChunkWithPRs(
             toState: t.toState,
             enteredAt: t.timestamp.toISOString(),
             leftAt: t.timestamp.toISOString(),
-            durationHours: 0,
+            rawDurationHours: 0,
+            workingDurationHours: 0,
             changedBy: t.changedBy,
             assignedToAtTransition: t.assignedTo,
           })),
@@ -1051,11 +1321,13 @@ async function processWorkItemChunkWithPRs(
             activePeriods: devTime.activePeriods.map(p => ({
               start: p.start.toISOString(),
               end: p.end?.toISOString() || null,
-              durationHours: Math.round(p.durationHours * 1000) / 1000,
+              rawDurationHours: Math.round(p.rawDurationHours * 1000) / 1000,
+              workingDurationHours: Math.round(p.workingDurationHours * 1000) / 1000,
               included: p.included,
               exclusionReason: p.exclusionReason,
             })),
-            totalActiveHours: Math.round(devTime.totalHours * 1000) / 1000,
+            totalRawHours: Math.round(devTime.totalRawHours * 1000) / 1000,
+            totalWorkingHours: Math.round(devTime.totalWorkingHours * 1000) / 1000,
             developmentCycles: devTime.cycles,
             stoppedAtFirstDevAcceptance: devTime.stoppedAtFirstDevAcceptance,
           },
@@ -1066,7 +1338,8 @@ async function processWorkItemChunkWithPRs(
               periods: c.periods.map(p => ({
                 start: p.start.toISOString(),
                 end: p.end.toISOString(),
-                durationHours: Math.round(p.durationHours * 1000) / 1000,
+                rawDurationHours: Math.round(p.rawDurationHours * 1000) / 1000,
+                workingDurationHours: Math.round(p.workingDurationHours * 1000) / 1000,
               })),
               merged: c.merged,
               mergeReason: c.mergeReason,
@@ -1079,7 +1352,8 @@ async function processWorkItemChunkWithPRs(
               periods: c.periods.map(p => ({
                 start: p.start.toISOString(),
                 end: p.end.toISOString(),
-                durationHours: Math.round(p.durationHours * 1000) / 1000,
+                rawDurationHours: Math.round(p.rawDurationHours * 1000) / 1000,
+                workingDurationHours: Math.round(p.workingDurationHours * 1000) / 1000,
               })),
               merged: c.merged,
               mergeReason: c.mergeReason,
@@ -1095,9 +1369,9 @@ async function processWorkItemChunkWithPRs(
             attributedTo: assignedTo,
           })),
           finalContribution: {
-            devActiveTimeHours: Math.round(devTime.totalHours * 1000) / 1000,
-            devTestTimeHours: Math.round([...devTestResult.metrics.values()].reduce((s, d) => s + d.hours, 0) * 1000) / 1000,
-            stgTestTimeHours: Math.round([...stgTestResult.metrics.values()].reduce((s, d) => s + d.hours, 0) * 1000) / 1000,
+            devActiveTimeHours: Math.round(devTime.totalWorkingHours * 1000) / 1000,
+            devTestTimeHours: Math.round(devTestResult.totalWorkingHours * 1000) / 1000,
+            stgTestTimeHours: Math.round(stgTestResult.totalWorkingHours * 1000) / 1000,
             codeReviewReturns: returnsData.cr,
             devTestingReturns: returnsData.dev,
             stgTestingReturns: returnsData.stg,
@@ -1110,23 +1384,25 @@ async function processWorkItemChunkWithPRs(
         
         emitDomainDebugLog(domainLog, jobId);
 
-        // Also store in debugLogs for response (legacy format)
         debugLogs.workItems[wi.id] = {
           workItemId: wi.id,
           title,
           currentAssignedTo: assignedTo,
           assignedToHistory: history,
+          originalEstimate: originalEstimate || null,
           activePeriods: devTime.activePeriods.map(p => ({
             start: p.start.toISOString(),
             end: p.end?.toISOString() || null,
-            durationHours: Math.round(p.durationHours * 100) / 100,
+            rawDurationHours: Math.round(p.rawDurationHours * 100) / 100,
+            workingDurationHours: Math.round(p.workingDurationHours * 100) / 100,
           })),
           devTestingCycles: devTestResult.cycles.map(c => ({
             tester: c.tester,
             periods: c.periods.map(p => ({
               start: p.start.toISOString(),
               end: p.end.toISOString(),
-              durationHours: Math.round(p.durationHours * 100) / 100,
+              rawDurationHours: Math.round(p.rawDurationHours * 100) / 100,
+              workingDurationHours: Math.round(p.workingDurationHours * 100) / 100,
             })),
             merged: c.merged,
             closingStatus: c.closingStatus,
@@ -1136,7 +1412,8 @@ async function processWorkItemChunkWithPRs(
             periods: c.periods.map(p => ({
               start: p.start.toISOString(),
               end: p.end.toISOString(),
-              durationHours: Math.round(p.durationHours * 100) / 100,
+              rawDurationHours: Math.round(p.rawDurationHours * 100) / 100,
+              workingDurationHours: Math.round(p.workingDurationHours * 100) / 100,
             })),
             merged: c.merged,
             closingStatus: c.closingStatus,
@@ -1158,7 +1435,7 @@ async function processWorkItemChunkWithPRs(
     }
   }
 
-  // Process PR comments for this chunk's work items
+  // Process PR comments
   const prResult = await processPRCommentsForChunk(org, project, pat, workItems, isVerbose, debugLogs, jobId);
   for (const [author, data] of Object.entries(prResult.aggregates)) {
     if (!prAgg[author]) prAgg[author] = { count: 0, prs: [] };
@@ -1178,6 +1455,8 @@ async function processWorkItemChunkWithPRs(
     requirements, 
     bugs, 
     tasks,
+    spAgg,
+    workItemsRaw,
     prStats: prResult.stats,
   };
 }
@@ -1215,7 +1494,6 @@ async function processPRCommentsForChunk(
 
   const prFetchStage = startStage(jobId, 'fetch_pr_comments');
 
-  // Process work items in smaller parallel batches to avoid API rate limits
   const PR_BATCH = 15;
   for (let i = 0; i < workItems.length; i += PR_BATCH) {
     const batch = workItems.slice(i, i + PR_BATCH);
@@ -1295,7 +1573,6 @@ async function getPRCommentsForItem(
     prCount++;
 
     try {
-      // API call to get PR details
       apiCalls++;
       const pr = await azureRequest(
         `https://dev.azure.com/${org}/${project}/_apis/git/repositories/${repoId}/pullrequests/${prId}?api-version=7.1`,
@@ -1304,14 +1581,11 @@ async function getPRCommentsForItem(
 
       const prUrl = `${pr.repository.webUrl}/pullrequest/${pr.pullRequestId}`;
 
-      // API call to get threads
       apiCalls++;
       const threadsResponse = await azureRequest(
         `https://dev.azure.com/${org}/${project}/_apis/git/repositories/${repoId}/pullrequests/${prId}/threads?api-version=7.1`,
         pat
       ) as { value: Array<{ id: number; comments: Array<{ id: number; author: { displayName: string }; commentType: string }> }> };
-
-      const prAuthors = new Set<string>();
 
       for (const thread of threadsResponse.value || []) {
         if (!thread.comments?.length) continue;
@@ -1321,7 +1595,6 @@ async function getPRCommentsForItem(
         const author = firstComment.author?.displayName || 'Unknown';
         const isText = firstComment.commentType === 'text';
 
-        // VERBOSE debug logging (only for small queries)
         if (isVerbose) {
           debugLogs.prComments.push({
             workItemId: workItem.id,
@@ -1335,7 +1608,6 @@ async function getPRCommentsForItem(
         }
 
         if (isText) {
-          prAuthors.add(author);
           commentCount++;
           commentsAggregated++;
 
@@ -1362,7 +1634,7 @@ async function getPRCommentsForItem(
   return { aggregates: result, prCount, commentCount, commentsFetched, commentsAggregated, apiCalls };
 }
 
-// ============== Result Merging (Numeric Summation Only) ==============
+// ============== Result Merging ==============
 
 function mergeChunkResultsNumeric(
   chunks: ChunkResult[],
@@ -1373,10 +1645,22 @@ function mergeChunkResultsNumeric(
   const mergedPrAgg: Record<string, { count: number; prs: PRReference[] }> = {};
   const allTesters = new Set<string>();
   const unassignedItems: WorkItemReference[] = [];
+  const allWorkItemsRaw: WorkItemRaw[] = [];
   let totalDevHours = 0, totalDevTestHours = 0, totalStgTestHours = 0;
   let requirements = 0, bugs = 0, tasks = 0;
 
-  // Merge all chunks with numeric summation
+  // Merged story points
+  const mergedSpAgg: StoryPointsAgg = {
+    totalSp: 0,
+    itemsWithSp: 0,
+    itemsWithoutSp: 0,
+    totalActiveHoursWithSp: 0,
+    fibonacciData: {},
+  };
+  for (const f of FIBONACCI_SEQUENCE) {
+    mergedSpAgg.fibonacciData[f] = { count: 0, totalHours: 0 };
+  }
+
   for (const chunk of chunks) {
     requirements += chunk.requirements;
     bugs += chunk.bugs;
@@ -1385,13 +1669,31 @@ function mergeChunkResultsNumeric(
     totalDevTestHours += chunk.totalDevTestHours;
     totalStgTestHours += chunk.totalStgTestHours;
     unassignedItems.push(...chunk.unassignedItems);
+    allWorkItemsRaw.push(...chunk.workItemsRaw);
+
+    // Merge story points
+    if (chunk.spAgg) {
+      mergedSpAgg.totalSp += chunk.spAgg.totalSp;
+      mergedSpAgg.itemsWithSp += chunk.spAgg.itemsWithSp;
+      mergedSpAgg.itemsWithoutSp += chunk.spAgg.itemsWithoutSp;
+      mergedSpAgg.totalActiveHoursWithSp += chunk.spAgg.totalActiveHoursWithSp;
+      for (const f of FIBONACCI_SEQUENCE) {
+        if (chunk.spAgg.fibonacciData[f]) {
+          mergedSpAgg.fibonacciData[f].count += chunk.spAgg.fibonacciData[f].count;
+          mergedSpAgg.fibonacciData[f].totalHours += chunk.spAgg.fibonacciData[f].totalHours;
+        }
+      }
+    }
 
     for (const t of chunk.testers) allTesters.add(t);
 
-    // Merge dev aggregates (numeric summation)
     for (const [dev, data] of Object.entries(chunk.devAgg)) {
       if (!mergedDevAgg[dev]) {
-        mergedDevAgg[dev] = { hours: 0, cycles: 0, cr: 0, dev: 0, stg: 0, completed: 0, items: [], returns: [], crReturns: [], devReturns: [], stgReturns: [] };
+        mergedDevAgg[dev] = { 
+          hours: 0, cycles: 0, cr: 0, dev: 0, stg: 0, completed: 0, 
+          totalSp: 0, itemsWithSp: 0,
+          items: [], returns: [], crReturns: [], devReturns: [], stgReturns: [] 
+        };
       }
       const m = mergedDevAgg[dev];
       m.hours += data.hours;
@@ -1400,6 +1702,8 @@ function mergeChunkResultsNumeric(
       m.dev += data.dev;
       m.stg += data.stg;
       m.completed += data.completed;
+      m.totalSp += data.totalSp;
+      m.itemsWithSp += data.itemsWithSp;
       m.items.push(...data.items);
       m.returns.push(...data.returns);
       m.crReturns.push(...data.crReturns);
@@ -1407,10 +1711,13 @@ function mergeChunkResultsNumeric(
       m.stgReturns.push(...data.stgReturns);
     }
 
-    // Merge tester aggregates (numeric summation)
     for (const [tester, data] of Object.entries(chunk.testerAgg)) {
       if (!mergedTesterAgg[tester]) {
-        mergedTesterAgg[tester] = { devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 };
+        mergedTesterAgg[tester] = { 
+          devHours: 0, stgHours: 0, devCycles: 0, stgCycles: 0, devIter: 0, stgIter: 0, 
+          totalSp: 0, itemsWithSp: 0,
+          closed: [], devItems: [], stgItems: [], prDetails: [], prsReviewed: 0 
+        };
       }
       const m = mergedTesterAgg[tester];
       m.devHours += data.devHours;
@@ -1419,12 +1726,13 @@ function mergeChunkResultsNumeric(
       m.stgCycles += data.stgCycles;
       m.devIter += data.devIter;
       m.stgIter += data.stgIter;
+      m.totalSp += data.totalSp;
+      m.itemsWithSp += data.itemsWithSp;
       m.closed.push(...data.closed);
       m.devItems.push(...data.devItems);
       m.stgItems.push(...data.stgItems);
     }
 
-    // Merge PR aggregates (numeric summation - already processed per chunk)
     for (const [author, data] of Object.entries(chunk.prAgg)) {
       if (!mergedPrAgg[author]) mergedPrAgg[author] = { count: 0, prs: [] };
       mergedPrAgg[author].count += data.count;
@@ -1440,7 +1748,6 @@ function mergeChunkResultsNumeric(
     }
   }
 
-  // Build final metrics
   const numTasks = requirements + bugs;
 
   const developerMetrics = Object.entries(mergedDevAgg).map(([developer, d]) => {
@@ -1458,6 +1765,9 @@ function mergeChunkResultsNumeric(
       avgCodeReviewReturnsPerTask: taskCount > 0 ? d.cr / taskCount : 0,
       avgDevTestingReturnsPerTask: taskCount > 0 ? d.dev / taskCount : 0,
       avgStgTestingReturnsPerTask: taskCount > 0 ? d.stg / taskCount : 0,
+      avgOriginalEstimate: d.itemsWithSp > 0 ? d.totalSp / d.itemsWithSp : 0,
+      totalOriginalEstimate: d.totalSp,
+      itemsWithEstimate: d.itemsWithSp,
       workItems: d.items,
       returnItems: d.returns,
       codeReviewReturnItems: d.crReturns,
@@ -1486,6 +1796,9 @@ function mergeChunkResultsNumeric(
       avgPrCommentsPerPr: prCount > 0 ? commentCount / prCount : 0,
       tasksWorkedOn: taskCount,
       prsReviewed: prCount,
+      avgOriginalEstimate: t.itemsWithSp > 0 ? t.totalSp / t.itemsWithSp : 0,
+      totalOriginalEstimate: t.totalSp,
+      itemsWithEstimate: t.itemsWithSp,
       closedItems: t.closed,
       devIterationItems: t.devItems,
       stgIterationItems: t.stgItems,
@@ -1503,6 +1816,34 @@ function mergeChunkResultsNumeric(
   const totalReturns = developerMetrics.reduce((s, d) => s + d.totalReturnCount, 0);
   const totalPrComments = Object.values(mergedPrAgg).reduce((s, p) => s + p.count, 0);
 
+  // Story points analytics
+  const avgStoryPoints = mergedSpAgg.itemsWithSp > 0 
+    ? mergedSpAgg.totalSp / mergedSpAgg.itemsWithSp 
+    : 0;
+  const costPerStoryPoint = mergedSpAgg.totalSp > 0 
+    ? mergedSpAgg.totalActiveHoursWithSp / mergedSpAgg.totalSp 
+    : 0;
+
+  const fibonacciBreakdown = FIBONACCI_SEQUENCE
+    .filter(f => mergedSpAgg.fibonacciData[f].count > 0)
+    .map(f => ({
+      estimate: f,
+      itemCount: mergedSpAgg.fibonacciData[f].count,
+      totalActiveHours: mergedSpAgg.fibonacciData[f].totalHours,
+      avgHoursPerSp: mergedSpAgg.fibonacciData[f].count > 0 
+        ? mergedSpAgg.fibonacciData[f].totalHours / (mergedSpAgg.fibonacciData[f].count * f)
+        : 0,
+    }));
+
+  const storyPointsAnalytics = {
+    averageStoryPoints: avgStoryPoints,
+    itemsWithEstimate: mergedSpAgg.itemsWithSp,
+    itemsWithoutEstimate: mergedSpAgg.itemsWithoutSp,
+    totalStoryPoints: mergedSpAgg.totalSp,
+    costPerStoryPoint,
+    fibonacciBreakdown,
+  };
+
   const summary = {
     totalWorkItems: workItems.length,
     totalRequirements: requirements,
@@ -1513,24 +1854,29 @@ function mergeChunkResultsNumeric(
     avgStgTestTimeHours: numTasks > 0 ? totalStgTestHours / numTasks : 0,
     totalReturns,
     totalPrComments,
+    avgStoryPoints,
+    costPerStoryPoint,
   };
 
   const chartData = {
-    developmentSpeed: developerMetrics.filter(d => d.avgDevTimeHours > 0).slice(0, 10).map(d => ({ name: d.developer, value: Math.round(d.avgDevTimeHours * 10) / 10 })),
-    devTestingSpeed: testerMetrics.filter(t => t.avgDevTestTimeHours > 0).slice(0, 10).map(t => ({ name: t.tester, value: Math.round(t.avgDevTestTimeHours * 10) / 10 })),
-    stgTestingSpeed: testerMetrics.filter(t => t.avgStgTestTimeHours > 0).slice(0, 10).map(t => ({ name: t.tester, value: Math.round(t.avgStgTestTimeHours * 10) / 10 })),
-    returns: developerMetrics.filter(d => d.totalReturnCount > 0).slice(0, 10).map(d => ({ name: d.developer, value: d.totalReturnCount })),
-    devIterations: testerMetrics.filter(t => t.devTestingIterations > 0).slice(0, 10).map(t => ({ name: t.tester, value: t.devTestingIterations })),
-    stgIterations: testerMetrics.filter(t => t.stgTestingIterations > 0).slice(0, 10).map(t => ({ name: t.tester, value: t.stgTestingIterations })),
-    prComments: prCommentAuthors.slice(0, 10).map(p => ({ name: p.author, value: p.count, isTester: p.isTester })),
+    developmentSpeed: developerMetrics.filter(d => d.avgDevTimeHours > 0).map(d => ({ name: d.developer, value: Math.round(d.avgDevTimeHours * 10) / 10 })),
+    devTestingSpeed: testerMetrics.filter(t => t.avgDevTestTimeHours > 0).map(t => ({ name: t.tester, value: Math.round(t.avgDevTestTimeHours * 10) / 10 })),
+    stgTestingSpeed: testerMetrics.filter(t => t.avgStgTestTimeHours > 0).map(t => ({ name: t.tester, value: Math.round(t.avgStgTestTimeHours * 10) / 10 })),
+    returns: developerMetrics.filter(d => d.totalReturnCount > 0).map(d => ({ name: d.developer, value: d.totalReturnCount })),
+    devIterations: testerMetrics.filter(t => t.devTestingIterations > 0).map(t => ({ name: t.tester, value: t.devTestingIterations })),
+    stgIterations: testerMetrics.filter(t => t.stgTestingIterations > 0).map(t => ({ name: t.tester, value: t.stgTestingIterations })),
+    prComments: prCommentAuthors.map(p => ({ name: p.author, value: p.count, isTester: p.isTester })),
+    storyPointsCost: fibonacciBreakdown.map(f => ({ name: `${f.estimate} SP`, value: Math.round(f.avgHoursPerSp * 10) / 10 })),
   };
 
   return {
     developerMetrics,
     testerMetrics,
     prCommentAuthors,
+    storyPointsAnalytics,
     summary,
     chartData,
     unassignedItems,
+    workItemsRaw: allWorkItemsRaw,
   };
 }
