@@ -5,6 +5,7 @@ import { MetricCard } from "./MetricCard";
 import { DeveloperMetricsTable } from "./DeveloperMetricsTable";
 import { TesterMetricsTable } from "./TesterMetricsTable";
 import { MetricsCharts } from "./MetricsCharts";
+import { StoryPointsCard } from "./StoryPointsCard";
 import type { AnalysisResult } from "@/types/metrics";
 import { t } from "@/lib/i18n";
 import { 
@@ -18,9 +19,11 @@ import {
   Table,
   Bug,
   FileText,
-  ListTodo
+  ListTodo,
+  Info
 } from "lucide-react";
 import { formatDuration } from "@/lib/formatters";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 interface AnalysisResultsProps {
   result: AnalysisResult;
@@ -30,7 +33,7 @@ interface AnalysisResultsProps {
 }
 
 export function AnalysisResults({ result, onBack, organization, project }: AnalysisResultsProps) {
-  const { summary, developerMetrics, testerMetrics, chartData } = result;
+  const { summary, developerMetrics, testerMetrics, chartData, storyPointsAnalytics } = result;
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -46,6 +49,12 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
           <ArrowLeft className="mr-2 h-4 w-4" />
           {t('newAnalysis')}
         </Button>
+      </div>
+
+      {/* Working time info */}
+      <div className="flex items-center gap-2 text-sm text-muted-foreground bg-accent/30 px-3 py-2 rounded-md">
+        <Info className="h-4 w-4" />
+        <span>{t('workingTimeInfo')}: {t('workingHours')}, {t('excludedDays')}</span>
       </div>
 
       {/* Summary Metrics */}
@@ -92,6 +101,11 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
           icon={TestTube2}
         />
       </div>
+
+      {/* Story Points Analytics */}
+      {storyPointsAnalytics && storyPointsAnalytics.itemsWithEstimate > 0 && (
+        <StoryPointsCard analytics={storyPointsAnalytics} />
+      )}
 
       {/* Work Item Breakdown */}
       <Card>

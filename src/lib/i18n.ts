@@ -20,6 +20,19 @@ export const labels = {
   devInTestingPerTask: 'DEV_In Testing на задачу',
   stgInTestingPerTask: 'STG_In Testing на задачу',
   
+  // Story Points
+  storyPointsAnalytics: 'Аналитика Story Points',
+  avgStoryPoints: 'Средний SP',
+  avgStoryPointsDesc: 'Средний Original Estimate',
+  costPerSp: 'Стоимость 1 SP',
+  costPerSpDesc: 'Рабочих часов на 1 Story Point',
+  itemsWithEstimate: 'С оценкой',
+  itemsWithoutEstimate: 'Без оценки',
+  fibonacciBreakdown: 'Разбивка по Fibonacci',
+  avgHoursPerSp: 'Ср. часов/SP',
+  itemCount: 'Элементов',
+  totalHours: 'Всего часов',
+  
   // Work item breakdown
   workItemBreakdown: 'Распределение рабочих элементов',
   requirements: 'Требования',
@@ -44,6 +57,7 @@ export const labels = {
   avgDevFixPerTask: 'Сред. DEV Fix/задачу',
   stgTestFix: 'STG Test → Fix',
   avgStgFixPerTask: 'Сред. STG Fix/задачу',
+  avgOriginalEstimate: 'Сред. SP',
   filterDevelopers: 'Фильтр разработчиков',
   selectDevelopers: 'Выбрать разработчиков',
   clearAll: 'Очистить все',
@@ -74,10 +88,13 @@ export const labels = {
   devIterationsPerTester: 'DEV итерации по тестировщикам',
   stgIterationsPerTester: 'STG итерации по тестировщикам',
   prCommentsByAuthor: 'Комментарии PR по авторам',
+  storyPointsCostChart: 'Стоимость Story Points по размеру',
   showTestersOnly: 'Только тестировщики',
   noTesterPrComments: 'Нет комментариев от тестировщиков',
   hours: 'Часы',
   count: 'Кол-во',
+  fullscreen: 'Полный экран',
+  exitFullscreen: 'Выйти из полноэкранного режима',
   
   // Drill-down modal
   workItemDetails: 'Детали рабочих элементов',
@@ -87,6 +104,10 @@ export const labels = {
   metricCount: 'Значение',
   assignedToChanged: 'Изменился исполнитель',
   assignedToHistory: 'История назначений',
+  activeTime: 'Время Active',
+  devTestTime: 'DEV тест',
+  stgTestTime: 'STG тест',
+  originalEstimate: 'SP',
   yes: 'Да',
   no: 'Нет',
   close: 'Закрыть',
@@ -165,6 +186,26 @@ export const labels = {
   prCommentsSkipped: 'Комментарии PR пропущены',
   prCommentsSkippedDesc: 'Для больших запросов анализ PR комментариев пропущен для экономии времени.',
   useNarrowerQuery: 'Используйте более узкий запрос для полных результатов.',
+  
+  // Filtering
+  filters: 'Фильтры',
+  filterByType: 'Фильтр по типу',
+  filterByState: 'Фильтр по состоянию',
+  filterByDateRange: 'Фильтр по дате',
+  stateFilter: 'Переход в состояние',
+  fromDate: 'С даты',
+  toDate: 'По дату',
+  applyFilters: 'Применить',
+  resetFilters: 'Сбросить',
+  activeFilters: 'Активные фильтры',
+  noFilters: 'Фильтры не применены',
+  workItemTypes: 'Типы элементов',
+  allTypes: 'Все типы',
+  
+  // Working time info
+  workingTimeInfo: 'Время рассчитывается с учетом рабочего календаря',
+  workingHours: 'Рабочие часы: 09:00-18:00 (UTC+3)',
+  excludedDays: 'Исключены: выходные и праздничные дни',
 } as const;
 
 export type LabelKey = keyof typeof labels;
