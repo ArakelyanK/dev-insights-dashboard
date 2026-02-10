@@ -4,7 +4,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { ExternalLink, AlertTriangle, History, X, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
+import { ExternalLink, AlertTriangle, History, X, ArrowUpDown, ArrowUp, ArrowDown, Maximize2, Minimize2 } from "lucide-react";
 import type { WorkItemReference } from "@/types/metrics";
 import { t } from "@/lib/i18n";
 import { formatDuration, formatNumber } from "@/lib/formatters";
@@ -33,6 +33,7 @@ export function DrillDownModal({
 }: DrillDownModalProps) {
   const [sortField, setSortField] = useState<SortField>('count');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
+  const [fullscreen, setFullscreen] = useState(false);
 
   const getWorkItemUrl = (id: number) => {
     return `https://dev.azure.com/${organization}/${project}/_workitems/edit/${id}`;
@@ -144,22 +145,28 @@ export function DrillDownModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl max-h-[80vh]">
+      <DialogContent className={`max-h-[90vh] ${fullscreen ? 'fixed inset-2 max-w-none w-auto' : 'max-w-[95vw] lg:max-w-7xl'}`}>
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between">
-            <span>{title}</span>
-            <Badge variant="outline" className="ml-2">
-              {items.length} {items.length === 1 ? 'элемент' : 'элементов'}
-            </Badge>
+            <span className="truncate mr-2">{title}</span>
+            <div className="flex items-center gap-2 shrink-0">
+              <Badge variant="outline">
+                {items.length} {items.length === 1 ? 'элемент' : 'элементов'}
+              </Badge>
+              <Button variant="ghost" size="sm" onClick={() => setFullscreen(!fullscreen)} className="h-8 w-8 p-0">
+                {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+              </Button>
+            </div>
           </DialogTitle>
         </DialogHeader>
         
-        <ScrollArea className="max-h-[60vh]">
+        <ScrollArea className={fullscreen ? "max-h-[calc(100vh-200px)]" : "max-h-[60vh]"}>
           {items.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
               Нет данных
             </div>
           ) : (
+            <div className="overflow-x-auto">
             <table className="data-table w-full">
               <thead>
                 <tr>
@@ -260,6 +267,7 @@ export function DrillDownModal({
                 ))}
               </tbody>
             </table>
+            </div>
           )}
         </ScrollArea>
         

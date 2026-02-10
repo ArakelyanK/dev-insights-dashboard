@@ -28,8 +28,9 @@ export const labels = {
   costPerSpDesc: 'Рабочих часов на 1 Story Point',
   itemsWithEstimate: 'С оценкой',
   itemsWithoutEstimate: 'Без оценки',
-  fibonacciBreakdown: 'Разбивка по Fibonacci',
+  fibonacciBreakdown: 'Разбивка по Story Points',
   avgHoursPerSp: 'Ср. часов/SP',
+  avgActiveHoursPerTask: 'Ср. часов Active/задачу',
   itemCount: 'Элементов',
   totalHours: 'Всего часов',
   

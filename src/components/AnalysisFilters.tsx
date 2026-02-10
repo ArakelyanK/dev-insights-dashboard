@@ -255,15 +255,22 @@ export function applyFilters(
   if (filters.stateTransition) {
     const { state, fromDate, toDate } = filters.stateTransition;
     result = result.filter(wi => {
-      return wi.stateTransitions.some(tr => {
-        if (tr.toState !== state) return false;
-        
-        const transitionDate = new Date(tr.timestamp);
-        if (fromDate && transitionDate < fromDate) return false;
-        if (toDate && transitionDate > toDate) return false;
-        
-        return true;
-      });
+      // Find the FIRST transition to the selected state (sorted by timestamp)
+      const matchingTransitions = wi.stateTransitions
+        .filter(tr => tr.toState === state)
+        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+      
+      if (matchingTransitions.length === 0) return false; // Never reached this state
+      
+      // If no date range specified, include all items that were ever in this state
+      if (!fromDate && !toDate) return true;
+      
+      // Filter by FIRST transition date
+      const firstTransitionDate = new Date(matchingTransitions[0].timestamp);
+      if (fromDate && firstTransitionDate < fromDate) return false;
+      if (toDate && firstTransitionDate > toDate) return false;
+      
+      return true;
     });
   }
 
