@@ -256,6 +256,25 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
     return recalculateMetrics(filteredItems, result);
   }, [filteredItems, result, hasActiveFilters]);
 
+  // Enrich developer workItems with DEV/STG test times from raw data (fix #7)
+  const enrichedDeveloperMetrics = useMemo(() => {
+    const rawItems = result.workItemsRaw || [];
+    if (rawItems.length === 0) return developerMetrics;
+    const rawMap = new Map(rawItems.map(r => [r.id, r]));
+    return developerMetrics.map(dev => ({
+      ...dev,
+      workItems: dev.workItems.map(wi => {
+        const raw = rawMap.get(wi.id);
+        if (!raw) return wi;
+        return {
+          ...wi,
+          devTestTimeHours: wi.devTestTimeHours ?? (raw.devTestTimeHours > 0 ? raw.devTestTimeHours : undefined),
+          stgTestTimeHours: wi.stgTestTimeHours ?? (raw.stgTestTimeHours > 0 ? raw.stgTestTimeHours : undefined),
+        };
+      }),
+    }));
+  }, [developerMetrics, result.workItemsRaw]);
+
   return (
     <div className="space-y-8 animate-fade-in">
       {/* Header */}
@@ -337,7 +356,12 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
 
       {/* Story Points Analytics */}
       {storyPointsAnalytics && storyPointsAnalytics.itemsWithEstimate > 0 && (
-        <StoryPointsCard analytics={storyPointsAnalytics} />
+        <StoryPointsCard 
+          analytics={storyPointsAnalytics}
+          workItemsRaw={filteredItems}
+          organization={organization}
+          project={project}
+        />
       )}
 
       {/* Work Item Breakdown */}
@@ -398,7 +422,7 @@ export function AnalysisResults({ result, onBack, organization, project }: Analy
             </CardHeader>
             <CardContent>
               <DeveloperMetricsTable 
-                metrics={developerMetrics} 
+                metrics={enrichedDeveloperMetrics} 
                 organization={organization}
                 project={project}
               />
