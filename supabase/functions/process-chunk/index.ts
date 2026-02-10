@@ -1258,17 +1258,23 @@ async function processWorkItemChunkWithPRs(
           }
         }
 
-        if (state === STATES.RELEASED && !ta.closed.find(x => x.id === wi.id)) {
-          const devHours = devTestResult.metrics.get(tester)?.workingHours || 0;
-          ta.closed.push({ 
-            ...ref, 
-            count: 1, 
-            devTestTimeHours: devHours,
-            stgTestTimeHours: data.workingHours,
-          });
-          if (originalEstimate !== undefined && originalEstimate > 0 && !attributedDevTesters.includes(tester)) {
-            ta.totalSp += originalEstimate;
-            ta.itemsWithSp++;
+        if (state === STATES.RELEASED) {
+          const existingClosed = ta.closed.find(x => x.id === wi.id);
+          if (existingClosed) {
+            // Tester already in closed from DEV testing — add STG time
+            existingClosed.stgTestTimeHours = data.workingHours;
+          } else {
+            const devHours = devTestResult.metrics.get(tester)?.workingHours || 0;
+            ta.closed.push({ 
+              ...ref, 
+              count: 1, 
+              devTestTimeHours: devHours,
+              stgTestTimeHours: data.workingHours,
+            });
+            if (originalEstimate !== undefined && originalEstimate > 0 && !attributedDevTesters.includes(tester)) {
+              ta.totalSp += originalEstimate;
+              ta.itemsWithSp++;
+            }
           }
         }
       }
