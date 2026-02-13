@@ -71,7 +71,8 @@ serve(async (req) => {
 
   try {
     const request = await req.json() as AnalysisRequest;
-    const { organization, project, queryId, pat, debug: requestDebug = false } = request;
+    const { organization, project, queryId, pat: requestPat, debug: requestDebug = false } = request;
+    const pat = requestPat || Deno.env.get('AZURE_DEVOPS_PAT') || '';
 
     if (!organization || !project || !queryId || !pat) {
       throw new Error('Missing required fields: organization, project, queryId, pat');

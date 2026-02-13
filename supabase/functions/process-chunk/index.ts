@@ -252,7 +252,8 @@ serve(async (req) => {
 
   try {
     const request = await req.json() as ProcessChunkRequest;
-    const { jobId, pat } = request;
+    const { jobId, pat: requestPat } = request;
+    const pat = requestPat || Deno.env.get('AZURE_DEVOPS_PAT') || '';
 
     if (!jobId || !pat) {
       throw new Error('Missing required fields: jobId, pat');

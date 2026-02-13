@@ -5,7 +5,7 @@ import { analyzeMetrics } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 import type { AnalysisRequest, AnalysisResult } from "@/types/metrics";
 import { t } from "@/lib/i18n";
-import { AlertCircle, Shield, Loader2 } from "lucide-react";
+import { AlertCircle, Loader2 } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 
 const Index = () => {
@@ -83,10 +83,6 @@ const Index = () => {
                 <p className="text-xs text-muted-foreground">{t('developmentTestingMetrics')}</p>
               </div>
             </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Shield className="h-3.5 w-3.5" />
-              <span>{t('secureAnalysis')}</span>
-            </div>
           </div>
         </div>
       </header>
@@ -133,23 +129,8 @@ const Index = () => {
               </div>
             )}
 
-            {/* Security Info */}
-            {!isLoading && (
-              <div className="max-w-2xl mx-auto">
-                <div className="p-4 rounded-lg bg-accent/50 border border-border">
-                  <h3 className="font-medium text-foreground flex items-center gap-2 mb-2">
-                    <Shield className="h-4 w-4 text-primary" />
-                    {t('securityPrivacy')}
-                  </h3>
-                  <ul className="text-sm text-muted-foreground space-y-1">
-                    <li>• {t('securityNote1')}</li>
-                    <li>• {t('securityNote2')}</li>
-                    <li>• {t('securityNote3')}</li>
-                    <li>• {t('securityNote4')}</li>
-                  </ul>
-                </div>
-              </div>
-            )}
+
+
 
             {/* Metrics Info */}
             {!isLoading && (
