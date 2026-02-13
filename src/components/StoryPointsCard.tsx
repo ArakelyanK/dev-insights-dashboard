@@ -154,7 +154,7 @@ export function StoryPointsCard({ analytics, workItemsRaw = [], organization = '
 
       {/* SP Drill-Down Dialog */}
       <Dialog open={drillDownOpen} onOpenChange={setDrillDownOpen}>
-        <DialogContent className={`max-h-[90vh] ${fullscreen ? 'fixed inset-2 max-w-none w-auto' : 'max-w-[95vw] lg:max-w-6xl'}`}>
+        <DialogContent className={`${fullscreen ? '!fixed !inset-4 !max-w-none !w-auto !max-h-none !translate-x-0 !translate-y-0 !top-0 !left-0 flex flex-col' : 'max-w-[95vw] lg:max-w-6xl max-h-[90vh]'}`}>
           <DialogHeader>
             <DialogTitle className="flex items-center justify-between">
               <span className="truncate mr-2">
@@ -169,7 +169,7 @@ export function StoryPointsCard({ analytics, workItemsRaw = [], organization = '
             </DialogTitle>
           </DialogHeader>
 
-          <ScrollArea className={fullscreen ? "max-h-[calc(100vh-200px)]" : "max-h-[60vh]"}>
+          <ScrollArea className={fullscreen ? "flex-1 overflow-auto" : "max-h-[60vh]"}>
             <div className="overflow-x-auto">
               <table className="data-table w-full">
                 <thead>

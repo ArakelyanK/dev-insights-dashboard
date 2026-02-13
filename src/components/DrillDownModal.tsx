@@ -145,7 +145,7 @@ export function DrillDownModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className={`max-h-[90vh] ${fullscreen ? 'fixed inset-2 max-w-none w-auto' : 'max-w-[95vw] lg:max-w-7xl'}`}>
+      <DialogContent className={`${fullscreen ? '!fixed !inset-4 !max-w-none !w-auto !max-h-none !translate-x-0 !translate-y-0 !top-0 !left-0 flex flex-col' : 'max-w-[95vw] lg:max-w-7xl max-h-[90vh]'}`}>
         <DialogHeader>
           <DialogTitle className="flex items-center justify-between">
             <span className="truncate mr-2">{title}</span>
@@ -160,7 +160,7 @@ export function DrillDownModal({
           </DialogTitle>
         </DialogHeader>
         
-        <ScrollArea className={fullscreen ? "max-h-[calc(100vh-200px)]" : "max-h-[60vh]"}>
+        <ScrollArea className={fullscreen ? "flex-1 overflow-auto" : "max-h-[60vh]"}>
           {items.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
               Нет данных
