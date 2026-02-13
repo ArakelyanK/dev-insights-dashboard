@@ -53,6 +53,7 @@ export async function analyzeMetrics(
   onProgress?: (step: string, progress: number) => void
 ): Promise<AnalysisResult> {
   // Step 1: Create the job (no processing happens here)
+  // PAT is resolved server-side from secret if empty
   const { data, error } = await supabase.functions.invoke('analyze-devops', {
     body: request,
   });
@@ -80,7 +81,7 @@ export async function analyzeMetrics(
   }
 
   // Step 2: Drive chunk processing with pull-based loop
-  return driveChunkProcessing(jobId, request.pat, totalChunks, onProgress);
+  return driveChunkProcessing(jobId, request.pat || '', totalChunks, onProgress);
 }
 
 /**
